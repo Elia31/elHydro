@@ -1,0 +1,6 @@
+# elHydro Partition Table (ESP32-C6, 4 MB Flash)
+# NVS vergrößert auf 256 KB (war 24 KB) für Offline-Puffer von 1000 Messungen.
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x40000
+phy_init,   data, phy,      0x49000,  0x1000
+factory,    app,  factory,  0x50000,  0x100000

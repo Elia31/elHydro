@@ -1,0 +1,31 @@
+# elHydro sdkconfig.defaults
+# Nur bewusst gesetzte Werte - alles andere nutzt ESP-IDF Defaults
+
+# Target
+CONFIG_IDF_TARGET="esp32c6"
+
+# Compiler: Size-Optimierung für batteriebetriebenes Gerät
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Bluetooth / NimBLE
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE=320
+
+# Power Management: DFS (dynamisches CPU-Frequenz-Scaling)
+CONFIG_PM_ENABLE=y
+
+# Watchdog: 60s (großzügig wegen BLE + Display-Refresh)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+
+# Log Level
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Partition Table: eigene Tabelle mit 256 KB NVS (siehe partitions.csv)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

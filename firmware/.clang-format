@@ -1,0 +1,66 @@
+# .clang-format - ESP32 / ESP-IDF (C)
+BasedOnStyle: LLVM
+Language: C
+
+# Einrückung & Zeilen
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 140
+IndentCaseLabels: true
+IndentGotoLabels: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+IndentPPDirectives: BeforeHash
+
+# Klammern: { in neuer Zeile (Allman)
+BreakBeforeBraces: Allman
+AllowShortFunctionsOnASingleLine: None
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Leerzeichen & Klammern
+SpaceBeforeParens: ControlStatements   # if (x) -> ja; foo(x) -> nein
+SpaceAfterCStyleCast: true
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpacesInAngles: false
+
+# Zeilenumbrüche bei langen Listen/Signaturen
+BinPackArguments: false
+BinPackParameters: false
+AlignAfterOpenBracket: Align
+AlignArrayOfStructures: Left
+PenaltyBreakBeforeFirstCallParameter: 300
+PenaltyBreakString: 1000
+
+# Operatoren/Zuordnungen
+BreakBeforeBinaryOperators: NonAssignment  # Zeilenumbruch vor +, && etc., aber nicht vor =
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# Zeiger/Referenzen
+DerivePointerAlignment: false
+PointerAlignment: Left     # uint8_t *ptr;
+
+# Includes: Reihenfolge wie im Code belassen (kein Sortieren, kein Regroup)
+SortIncludes: false
+IncludeBlocks: Preserve
+
+# Kommentare & Doxygen
+ReflowComments: false       # Doxygen-Blöcke nicht umbrechen
+AlignTrailingComments: true
+
+# Sonstiges
+Cpp11BracedListStyle: false
+AlwaysBreakBeforeMultilineStrings: true

@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+bleak
+httpx
+openpyxl
+qrcode[pil]
+pystray
+zeroconf

@@ -1,0 +1,21 @@
+# Firmware (ESP-IDF)
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+
+# Webapp (Python)
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+webapp/data/
+webapp/build/
+webapp/dist/
+
+# Editor / Betriebssystem
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
