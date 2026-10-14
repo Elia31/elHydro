@@ -57,8 +57,8 @@
 // Wasserpumpe (JT-DC3W, MOSFET-gesteuert)
 // ============================================================================
 
-#define VALVE_GPIO         GPIO_NUM_8 // MOSFET Gate (10kΩ Pull-Down)
-#define VALVE_ACTIVE_LEVEL 1          // HIGH = an, LOW = aus
+#define PUMP_GPIO         GPIO_NUM_8 // MOSFET Gate (10kΩ Pull-Down)
+#define PUMP_ACTIVE_LEVEL 1          // HIGH = an, LOW = aus
 
 // ============================================================================
 // Stromversorgung (schaltbare VCC-Pins für Sensoren)

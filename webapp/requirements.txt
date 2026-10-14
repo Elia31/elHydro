@@ -1,8 +1,8 @@
-fastapi
-uvicorn[standard]
-bleak
-httpx
-openpyxl
-qrcode[pil]
-pystray
-zeroconf
+fastapi>=0.116,<1
+uvicorn[standard]>=0.35,<1
+bleak>=1.1,<2
+httpx>=0.28,<1
+openpyxl>=3.1,<4
+qrcode[pil]>=8.2,<9
+pystray>=0.19,<1
+zeroconf>=0.148,<1

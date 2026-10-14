@@ -36,7 +36,47 @@ static void draw_text_right(int right_x, int y, const char* text, int scale, dis
     display_hal_draw_text(x, y, text, scale, color);
 }
 
-// Formatiert Unix-Zeitstempel als "HH:MM DD.MM.YYYY" (Lokalzeit via TIMEZONE_OFFSET_S)
+#if TIMEZONE_EU_DST
+// Wochentag nach Sakamoto (0 = Sonntag), month 1-12
+static int day_of_week(int year, int month, int day)
+{
+    static const int offsets[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    if (month < 3)
+    {
+        year -= 1;
+    }
+    return (year + year / 4 - year / 100 + year / 400 + offsets[month - 1] + day) % 7;
+}
+
+// EU-Sommerzeit: letzter Sonntag im März 01:00 UTC bis letzter Sonntag im Oktober 01:00 UTC
+static bool is_eu_dst(time_t utc)
+{
+    struct tm tm_utc;
+    gmtime_r(&utc, &tm_utc);
+
+    int year  = tm_utc.tm_year + 1900;
+    int month = tm_utc.tm_mon + 1;
+
+    if (month < 3 || month > 10)
+    {
+        return false;
+    }
+    if (month > 3 && month < 10)
+    {
+        return true;
+    }
+
+    // März und Oktober haben 31 Tage
+    int last_sunday = 31 - day_of_week(year, month, 31);
+    if (month == 3)
+    {
+        return tm_utc.tm_mday > last_sunday || (tm_utc.tm_mday == last_sunday && tm_utc.tm_hour >= 1);
+    }
+    return tm_utc.tm_mday < last_sunday || (tm_utc.tm_mday == last_sunday && tm_utc.tm_hour < 1);
+}
+#endif
+
+// Formatiert Unix-Zeitstempel als "HH:MM DD.MM.YYYY" (Lokalzeit via TIMEZONE_OFFSET_S + ggf. Sommerzeit)
 static void format_datetime(uint32_t unix_time, char* buf, size_t buf_size)
 {
     if (unix_time == 0)
@@ -45,9 +85,16 @@ static void format_datetime(uint32_t unix_time, char* buf, size_t buf_size)
         return;
     }
 
-    time_t     t       = (time_t) unix_time + TIMEZONE_OFFSET_S;
-    struct tm* tm_info = gmtime(&t);
-    strftime(buf, buf_size, "%H:%M %d.%m.%Y", tm_info);
+    time_t t = (time_t) unix_time + TIMEZONE_OFFSET_S;
+#if TIMEZONE_EU_DST
+    if (is_eu_dst((time_t) unix_time))
+    {
+        t += 3600;
+    }
+#endif
+    struct tm tm_info;
+    gmtime_r(&t, &tm_info);
+    strftime(buf, buf_size, "%H:%M %d.%m.%Y", &tm_info);
 }
 
 // Formatiert eine Zeitdauer als lesbaren String
@@ -547,6 +594,52 @@ void display_ui_show_calibration_timeout(void)
     display_hal_update();
 }
 
+void display_ui_show_calibration_failed(int raw_dry, int raw_wet)
+{
+    const int width  = display_hal_width();
+    const int margin = 6;
+    int       y      = 6;
+    char      buf[32];
+
+    display_hal_clear(DISPLAY_COLOR_WHITE);
+
+    // Titel
+    const char* title   = "KALIBRIERUNG";
+    int         title_w = (int) strlen(title) * (FONT_WIDTH * 2 + CHAR_SPACING);
+    display_hal_draw_text((width - title_w) / 2, y, title, 2, DISPLAY_COLOR_BLACK);
+    y += FONT_HEIGHT * 2 + 4;
+
+    display_hal_draw_hline(margin, y, width - 2 * margin, DISPLAY_COLOR_BLACK);
+    y += 3;
+
+    // Fehlermeldung
+    const char* failed   = "UNGUELTIG";
+    int         failed_w = (int) strlen(failed) * (FONT_WIDTH * 2 + CHAR_SPACING);
+    display_hal_draw_text((width - failed_w) / 2, y, failed, 2, DISPLAY_COLOR_RED);
+    y += FONT_HEIGHT * 2 + 6;
+
+    // Gemessene Werte
+    snprintf(buf, sizeof(buf), "Trocken: %d  Nass: %d", raw_dry, raw_wet);
+    display_hal_draw_text(margin, y, buf, 1, DISPLAY_COLOR_BLACK);
+    y += FONT_HEIGHT + 4;
+
+    display_hal_draw_text(margin, y, "Trocken muss deutlich ueber Nass liegen.", 1, DISPLAY_COLOR_BLACK);
+    y += FONT_HEIGHT + 2;
+
+    display_hal_draw_text(margin, y, "Alte Werte behalten.", 1, DISPLAY_COLOR_BLACK);
+    y += FONT_HEIGHT + 6;
+
+    display_hal_draw_hline(margin, y, width - 2 * margin, DISPLAY_COLOR_BLACK);
+    y += 3;
+
+    display_hal_draw_text(margin, y, "Boot-Taste", 2, DISPLAY_COLOR_BLACK);
+    y += FONT_HEIGHT * 2 + 2;
+
+    display_hal_draw_text(margin, y, "druecken zum Starten", 2, DISPLAY_COLOR_BLACK);
+
+    display_hal_update();
+}
+
 // ============================================================================
 // Werksreset-Screens
 // ============================================================================
@@ -571,7 +664,9 @@ void display_ui_show_factory_reset_confirm(void)
     display_hal_draw_text(margin, y, "Reset ausloesen?", 1, DISPLAY_COLOR_RED);
     y += FONT_HEIGHT + 4;
 
-    display_hal_draw_text(margin, y, "3x Reset-Taste gedrueckt.", 1, DISPLAY_COLOR_BLACK);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%dx Reset-Taste gedrueckt.", FACTORY_RESET_CLICK_COUNT);
+    display_hal_draw_text(margin, y, buf, 1, DISPLAY_COLOR_BLACK);
     y += FONT_HEIGHT + 2;
 
     display_hal_draw_text(margin, y, "Alle Einstellungen und", 1, DISPLAY_COLOR_BLACK);

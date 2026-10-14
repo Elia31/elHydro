@@ -10,7 +10,7 @@ Regen-Überspringung und Alerts bei kritischen Zuständen.
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 MIN_SLEEP_S = 600               # 10 Minuten (globales Minimum nach allen Multiplikatoren)
 MAX_SLEEP_S = 86400             # 24 Stunden
@@ -24,6 +24,9 @@ DRYING_SAFETY_FACTOR = 0.7      # 70% der vorhergesagten Zeit → 30% Sicherheit
 # Bewässerung nie auslöst. Schwelle = max(target - delta, target * 20%, 5%)
 IRR_THRESHOLD_TARGET_RATIO = 0.2  # Schwelle mind. 20% vom Target
 IRR_THRESHOLD_MIN_ABS = 5         # Absolutes Minimum 5%
+# Bis 2 % unter dem Ziel gießt die Firmware nicht (IRR_TARGET_TOLERANCE_PCT),
+# höher darf die Schwelle auch mit Verdunstungszuschlag nicht liegen
+IRR_TARGET_TOLERANCE_PCT = 2
 
 # Frost-Sperre: Wasser gefriert, Pumpe könnte Schaden nehmen
 FROST_TEMP_C = 0.0
@@ -44,6 +47,26 @@ class BrainDecision:
     should_irrigate: bool
     reasoning: str
     alerts: list = field(default_factory=list)
+
+
+def _target_min(target):
+    """Untergrenze jeder Schwelle: 20 % vom Ziel, mindestens 5 %."""
+    return max(int(target * IRR_THRESHOLD_TARGET_RATIO), IRR_THRESHOLD_MIN_ABS)
+
+
+def soil_threshold(target, delta):
+    """Gieß-Schwelle ohne Verdunstung: max(target - delta, 20 % vom Ziel, 5 %).
+    Darunter gilt der Boden als zu trocken (Schlafdauer, Nachtmodus, Anzeige)."""
+    return max(target - delta, _target_min(target))
+
+
+def irrigation_threshold(target, delta, evap_adj=0):
+    """Schwelle, unter der gegossen wird: um den Verdunstungszuschlag angehoben,
+    höchstens Ziel - 2 %. Gleiche Rechnung wie die Offline-Logik der Firmware.
+    Ohne die Obergrenze läge die Schwelle bei kleinem Delta über dem Ziel,
+    und es würde bei vollem Boden gegossen."""
+    return min(max(target - delta + evap_adj, _target_min(target)),
+               target - IRR_TARGET_TOLERANCE_PCT)
 
 
 def _evap_delta(temp_c, rh_pct):
@@ -150,8 +173,7 @@ class Brain:
         alerts = []
 
         # Basis-Schwelle (ohne Verdunstung) — für Sleep und Nachtmodus
-        target_min = max(int(target * IRR_THRESHOLD_TARGET_RATIO), IRR_THRESHOLD_MIN_ABS)
-        base_threshold = max(target - delta, target_min)
+        base_threshold = soil_threshold(target, delta)
 
         # --- 1. Basis: Trocknungsraten-Vorhersage ---
         if current_soil < base_threshold:
@@ -240,25 +262,25 @@ class Brain:
                 reasons.append(f"Leichter Regen erwartet ({rain_1h:.1f}mm in 1h)")
 
         # --- 6. Nachtmodus (22:00 - 06:00) ---
+        # Fällt die geplante Aufwachzeit in die Nacht, wird auf 06:00 verschoben
+        # (Verlängerung auf maximal 12 h), statt nachts ohne Verdunstung erneut zu messen.
         if now_ts is None:
             now_ts = int(time.time())
-        hour = datetime.fromtimestamp(now_ts).hour
-        if hour >= 22 or hour < 6:
-            if current_soil >= base_threshold:  # Nicht unter Bewässerungsschwelle
-                if hour >= 22:
-                    hours_until_morning = (24 - hour) + 6
-                else:
-                    hours_until_morning = 6 - hour
-                night_sleep = hours_until_morning * 3600
-                if night_sleep > sleep_s:
-                    sleep_s = min(night_sleep, 43200)
-                    reasons.append(f"Nachtmodus (bis ~06:00)")
+        wake = datetime.fromtimestamp(now_ts + sleep_s)
+        if (wake.hour >= 22 or wake.hour < 6) and current_soil >= base_threshold:
+            morning = wake.replace(hour=6, minute=0, second=0, microsecond=0)
+            if wake.hour >= 22:
+                morning += timedelta(days=1)
+            night_sleep = min(int(morning.timestamp()) - now_ts, 43200)
+            if night_sleep > sleep_s:
+                sleep_s = night_sleep
+                reasons.append("Nachtmodus (bis 06:00)")
 
         # --- 7. Limits ---
         sleep_s = int(max(MIN_SLEEP_S, min(MAX_SLEEP_S, sleep_s)))
 
         # --- 8. Bewässerungsentscheidung ---
-        irr_threshold = max(target - delta + evap_adj, target_min)
+        irr_threshold = irrigation_threshold(target, delta, evap_adj)
         should_irrigate = current_soil < irr_threshold
 
         # Frost-Sperre: bei ≤0°C nie gießen (Wasser gefriert, Pumpenschaden)
@@ -278,7 +300,7 @@ class Brain:
         # Regen-Check
         if should_irrigate and rain_expected and is_outdoor:
             should_irrigate = False
-            reasons.append(f"Bewässerung übersprungen (Regen erwartet)")
+            reasons.append("Bewässerung übersprungen (Regen erwartet)")
             alerts.append({"type": "irrigation_skipped_rain",
                            "message": "Bewässerung wegen Regenvorhersage übersprungen"})
 
@@ -286,8 +308,6 @@ class Brain:
             reasons.append(f"Bewässerung ausgelöst (Boden {current_soil}% < Schwelle {irr_threshold}%)")
             sleep_s = VERIFICATION_SLEEP_S
             reasons.append(f"Verifikation nach Bewässerung → Sleep {VERIFICATION_SLEEP_S // 60} Min")
-        elif current_soil >= irr_threshold and not cooldown_active:
-            pass  # Keine extra Begründung nötig
 
         # --- 9. Alerts ---
         dry_critical = current_soil < (irr_threshold - 5)

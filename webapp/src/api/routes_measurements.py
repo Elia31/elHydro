@@ -1,14 +1,15 @@
 # src/api/routes_measurements.py
 # REST-Endpunkte für Messdaten: liefert Messhistorie, Live-Daten und Excel/CSV-Export.
 import io
-import json
-import os
 from datetime import datetime
 from typing import List
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
-from src.utils.constants import load_plant_presets, PRESETS_FILE, DEFAULT_IRR_DELTA
+from pydantic import BaseModel, Field
+from src.utils.constants import (
+    load_plant_presets, write_plant_presets, DEFAULT_IRR_DELTA,
+    TARGET_SOIL_MIN, TARGET_SOIL_MAX, IRR_DELTA_MIN, IRR_DELTA_MAX,
+)
 
 router = APIRouter()
 
@@ -61,7 +62,6 @@ def export_excel(mac: str):
         raise HTTPException(status_code=404, detail="Keine Messdaten vorhanden")
 
     try:
-        import openpyxl
         from openpyxl import Workbook
         from openpyxl.chart import LineChart, Reference
         from openpyxl.utils import get_column_letter
@@ -78,28 +78,32 @@ def export_excel(mac: str):
         "Mess-ID", "Zeitstempel", "Online",
         "Bodenfeuchte (%)", "Temperatur (°C)",
         "Luftfeuchte (%)", "Batterie (V)", "Ziel-Feuchte (%)",
-        "Bewässert", "Bewässerungsdauer (ms)", "Ges. Bewässerung (ms)",
+        "Bewässert", "Bewässerungsdauer (ms)", "Ges. Bewässerung (ms)", "Trockenlauf",
         "Brain Schlafzeit (s)", "Brain Bewässerung", "Brain Begründung",
         "Letzte Schlafdauer (s)",
     ]
     ws_data.append(headers)
 
     for row in history:
-        ts = row.get("timestamp", 0)
+        # Als echtes Datum, damit Excel danach sortieren und filtern kann
+        ts = row.get("timestamp")
         if isinstance(ts, (int, float)) and ts > 0:
-            ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            ts_value = datetime.fromtimestamp(ts)
         else:
-            ts_str = str(ts)
+            ts_value = None  # Zeit unbekannt
 
+        # Gepufferte Messungen hat das Brain nicht entschieden: Feld bleibt leer
         brain_irr = row.get("brain_irrigate")
-        if isinstance(brain_irr, str):
+        if brain_irr in (None, ""):
+            brain_irr_str = None
+        elif isinstance(brain_irr, str):
             brain_irr_str = "Ja" if brain_irr.lower() in ("true", "1") else "Nein"
         else:
             brain_irr_str = "Ja" if brain_irr else "Nein"
 
         ws_data.append([
             row.get("measurement_id"),
-            ts_str,
+            ts_value,
             "Ja" if row.get("online") else "Nein",
             row.get("soil_pct"),
             row.get("temp"),
@@ -109,6 +113,7 @@ def export_excel(mac: str):
             "Ja" if row.get("irrigated") else "Nein",
             row.get("irrigation_ms", 0),
             row.get("total_irrigation_ms", 0),
+            "Ja" if row.get("pump_dry") else "Nein",
             row.get("brain_sleep_s"),
             brain_irr_str,
             row.get("brain_reasoning", ""),
@@ -118,6 +123,9 @@ def export_excel(mac: str):
     # Spaltenbreiten
     for col_idx, header in enumerate(headers, 1):
         ws_data.column_dimensions[get_column_letter(col_idx)].width = max(len(header) + 2, 14)
+    ws_data.column_dimensions["B"].width = 20
+    for cell in ws_data["B"][1:]:
+        cell.number_format = "YYYY-MM-DD HH:MM:SS"
 
     # --- Sheet 2: Diagramme (letzte 50 Messungen) ---
     chart_data = history[-50:]
@@ -246,7 +254,7 @@ def export_excel(mac: str):
         chart3.add_data(vbat_ref, titles_from_data=True)
         chart3.set_categories(cats)
 
-        # Styling: rote Balken
+        # Styling: grüne Balken
         chart3.series[0].graphicalProperties.solidFill = "27AE60"
 
         # Y-Achse: Bereich an Daten anpassen (nicht bei 0 starten)
@@ -306,17 +314,23 @@ def get_plant_presets():
 
 
 class PresetModel(BaseModel):
-    id: str
-    name: str
-    target_soil_pct: int
-    sleep_multiplier: float
-    irrigation_start_delta: int = DEFAULT_IRR_DELTA
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    # Gleiche Grenzen wie bei den Geräte-Einstellungen
+    target_soil_pct: int = Field(ge=TARGET_SOIL_MIN, le=TARGET_SOIL_MAX)
+    sleep_multiplier: float = Field(gt=0, le=5)
+    irrigation_start_delta: int = Field(DEFAULT_IRR_DELTA, ge=IRR_DELTA_MIN, le=IRR_DELTA_MAX)
 
 
 @router.put("/plant-presets")
 def save_plant_presets(presets: List[PresetModel]):
-    """Speichert die gesamte Preset-Liste."""
+    """Speichert die gesamte Preset-Liste. Geräte verweisen über die id auf ihr
+    Preset, Umbenennungen brauchen deshalb keine Anpassung der Geräte."""
     data = [p.model_dump() for p in presets]
-    with open(PRESETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    if len({p["id"] for p in data}) != len(data):
+        raise HTTPException(status_code=422, detail="Preset-IDs müssen eindeutig sein")
+    if len({p["name"].strip() for p in data}) != len(data):
+        raise HTTPException(status_code=422, detail="Preset-Namen müssen eindeutig sein")
+
+    write_plant_presets(data)
     return {"status": "ok", "count": len(data)}

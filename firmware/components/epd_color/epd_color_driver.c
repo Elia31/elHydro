@@ -60,7 +60,7 @@ static esp_err_t send_data_byte(epd_color_t* epd, uint8_t value)
 // ============================================================================
 // Hinweis: Beim 4-Farben-Display ist BUSY=HIGH wenn bereit (invertiert zu BW!)
 
-static void wait_busy(epd_color_t* epd, const char* context)
+static esp_err_t wait_busy(epd_color_t* epd, const char* context)
 {
     if (epd->debug)
     {
@@ -77,9 +77,10 @@ static void wait_busy(epd_color_t* epd, const char* context)
         if (esp_timer_get_time() - start > BUSY_TIMEOUT_US)
         {
             ESP_LOGW(TAG, "BUSY Timeout bei: %s", context);
-            break;
+            return ESP_ERR_TIMEOUT;
         }
     }
+    return ESP_OK;
 }
 
 // ============================================================================
@@ -106,27 +107,33 @@ static void transform_coords(epd_color_t* epd, int x, int y, int* phys_x, int* p
 // Hardware-Reset
 // ============================================================================
 
-static void hardware_reset(epd_color_t* epd)
+static esp_err_t hardware_reset(epd_color_t* epd)
 {
     vTaskDelay(pdMS_TO_TICKS(20));   // Warten vor Reset
     gpio_set_level(epd->pin_rst, 0); // Reset LOW
     vTaskDelay(pdMS_TO_TICKS(40));   // Reset halten
     gpio_set_level(epd->pin_rst, 1); // Reset HIGH
     vTaskDelay(pdMS_TO_TICKS(50));   // Stabilisieren
-    wait_busy(epd, "Hardware-Reset");
+    return wait_busy(epd, "Hardware-Reset");
 }
 
 // ============================================================================
 // JD79661 Initialisierungssequenz
 // ============================================================================
 
-static void init_sequence(epd_color_t* epd)
+static esp_err_t init_sequence(epd_color_t* epd)
 {
-    hardware_reset(epd);
+    if (hardware_reset(epd) != ESP_OK)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
 
     // Power ON
     send_command(epd, 0x04);
-    wait_busy(epd, "Power On");
+    if (wait_busy(epd, "Power On") != ESP_OK)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
 
     // Panel Setting (PSR)
     send_command(epd, 0x4D);
@@ -187,7 +194,7 @@ static void init_sequence(epd_color_t* epd)
     send_command(epd, 0x30);
     send_data_byte(epd, 0x08);
 
-    wait_busy(epd, "Init-Sequenz");
+    return wait_busy(epd, "Init-Sequenz");
 }
 
 // ============================================================================
@@ -283,8 +290,16 @@ esp_err_t epd_color_init(epd_color_t*      epd,
     // Mit Schwarz initialisieren (0x00 = alle Pixel schwarz)
     memset(epd->framebuffer, 0x00, epd->fb_size);
 
-    // Display initialisieren
-    init_sequence(epd);
+    // Display initialisieren (hängt BUSY, ist das Display defekt oder nicht angeschlossen)
+    ret = init_sequence(epd);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display reagiert nicht (BUSY-Timeout)");
+        epd_color_deinit(epd);
+        spi_bus_remove_device(epd->spi);
+        spi_bus_free(host);
+        return ret;
+    }
 
     ESP_LOGI(TAG, "Initialisierung abgeschlossen");
     return ESP_OK;
@@ -325,9 +340,14 @@ void epd_color_draw_pixel(epd_color_t* epd, int x, int y, uint8_t color)
     epd->framebuffer[byte_idx] = (epd->framebuffer[byte_idx] & ~mask) | value;
 }
 
-void epd_color_update(epd_color_t* epd)
+esp_err_t epd_color_update(epd_color_t* epd)
 {
-    init_sequence(epd);
+    esp_err_t ret = init_sequence(epd);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display reagiert nicht, Update abgebrochen");
+        return ret;
+    }
 
     // Framebuffer zum Display übertragen (in Chunks)
     send_command(epd, 0x10);
@@ -354,6 +374,8 @@ void epd_color_update(epd_color_t* epd)
     {
         ESP_LOGI(TAG, "Vollständiges Update abgeschlossen");
     }
+
+    return ESP_OK;
 }
 
 void epd_color_sleep(epd_color_t* epd)

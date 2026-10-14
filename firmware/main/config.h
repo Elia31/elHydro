@@ -19,6 +19,12 @@
 #define BLE_POLL_MS            20              // Poll-Intervall beim Warten auf Verbindung
 #define CALIBRATION_TIMEOUT_MS (5 * 60 * 1000) // Maximale Wartezeit bei Kalibrierung (5 Minuten)
 #define VCC_INIT_TIME          100             // Stabilisierungszeit nach Sensor-Einschalten
+#define ERROR_RETRY_SLEEP_S    (10 * 60)       // Deep Sleep nach Init-Fehler bis zum nächsten Versuch
+
+// Erst-Einrichtung: So lange wird auf den Host gewartet, danach schläft der Knoten und
+// versucht es erneut (sonst leert das dauerhafte Advertising ohne Host den Akku in Tagen)
+#define SETUP_WAIT_TIMEOUT_MS (10 * 60 * 1000) // 10 Minuten auf den Host warten
+#define SETUP_RETRY_SLEEP_S   (30 * 60)        // dann 30 Minuten schlafen
 
 // ============================================================================
 // Bewässerungssteuerung
@@ -33,6 +39,12 @@
 #define IRR_MAX_TOTAL_MS 60000 // Maximale Gesamtgießzeit pro Zyklus (60s)
 
 #define IRR_TARGET_TOLERANCE_PCT 2 // Akzeptable Abweichung zum Target Soil wo wir nicht nochmal gießen
+
+// Trockenlauf-Erkennung: Steigt die Bodenfeuchte nach IRR_DRY_CHECK_STEPS Gießschritten nicht um
+// mindestens IRR_DRY_MIN_RISE_PCT, fördert die Pumpe vermutlich kein Wasser (Tank leer, Schlauch
+// abgerutscht). Dann wird abgebrochen, statt die Pumpe bis IRR_MAX_TOTAL_MS trocken laufen zu lassen.
+#define IRR_DRY_CHECK_STEPS  3
+#define IRR_DRY_MIN_RISE_PCT 2
 
 // Schwellenwert-Sicherung: verhindert dass durch Fehlkonfiguration (großes Delta)
 // die Bewässerung nie auslöst. Schwelle = max(target - delta, target * FACTOR/100, MIN_PCT)
@@ -55,6 +67,12 @@
 #define DEFAULT_IRRIGATION_DELTA 10            // Bewässerung wenn Target Soil um 10% unterschritten
 #define DEFAULT_OFFLINE_SLEEP_S  (4 * 60 * 60) // Sleep-Dauer ohne BLE-Verbindung (4h)
 
+// Grenzen für Werte vom Host (Schutz vor Fehlkonfiguration und unsinnigen BLE-Writes)
+#define SLEEP_MIN_S         60             // Kürzeste Schlafzeit vom Host (1 min)
+#define SLEEP_MAX_S         (24 * 60 * 60) // Längste Schlafzeit vom Host (24h)
+#define OFFLINE_SLEEP_MIN_S (10 * 60)      // Offline-Sleep mindestens 10 min
+#define OFFLINE_SLEEP_MAX_S (24 * 60 * 60) // Offline-Sleep höchstens 24h
+
 // ============================================================================
 // Bodenfeuchtesensor-Typ (genau einer muss aktiviert sein)
 // ============================================================================
@@ -74,6 +92,10 @@
     #define DEFAULT_CALIB_RAW_DRY 2600
     #define DEFAULT_CALIB_RAW_WET 800
 #endif
+
+// Mindestabstand zwischen Trocken- und Nasswert bei der Kalibrierung (ADC-Rohwerte).
+// Kleinere Abstände (oder vertauschte Schritte) werden verworfen.
+#define CALIB_MIN_SPAN_RAW 300
 
 // ============================================================================
 // Display-Einstellungen
@@ -96,9 +118,12 @@
 // extra Debug-Ausgaben für Display-Treiber
 #define DISPLAY_DEBUG false
 
-// Zeitzonen-Offset für Anzeige (Lokalzeit = UTC + Offset)
-// MESZ (Sommerzeit): 2 * 3600, MEZ (Winterzeit): 1 * 3600
-#define TIMEZONE_OFFSET_S (2 * 3600)
+// Zeitzonen-Offset für Anzeige (Lokalzeit = UTC + Offset), Normalzeit (MEZ: 1 * 3600)
+#define TIMEZONE_OFFSET_S (1 * 3600)
+
+// Sommerzeit nach EU-Regel automatisch berücksichtigen (+1h vom letzten Sonntag
+// im März bis zum letzten Sonntag im Oktober, jeweils 01:00 UTC)
+#define TIMEZONE_EU_DST 1 // 1 = aktiv, 0 = nur TIMEZONE_OFFSET_S
 
 // Schwellwerte für Farbcodierung der Bodenfeuchte-Abweichung (in Prozentpunkten)
 // clang-format off
@@ -122,11 +147,11 @@
 // ============================================================================
 // Offline-Puffer
 // ============================================================================
-// HINWEIS: MAX_BUFFER_ENTRIES haengt von der NVS-Partition-Groesse ab.
-// Eine Messung (measurement_t) ist 80 B, mit NVS-Overhead ~128 B pro Eintrag:
-//   24 KB NVS  -> max. ~150 Eintraege
-//   256 KB NVS -> max. ~1700 Eintraege  (aktuelle Partition, siehe partitions.csv)
-//   1 MB NVS   -> max. ~6500 Eintraege
+// HINWEIS: MAX_BUFFER_ENTRIES hängt von der NVS-Partition-Größe ab.
+// Eine Messung (measurement_t) ist 81 B, mit NVS-Overhead ~128 B pro Eintrag:
+//   24 KB NVS  -> max. ~150 Einträge
+//   256 KB NVS -> max. ~1700 Einträge  (aktuelle Partition, siehe partitions.csv)
+//   1 MB NVS   -> max. ~6500 Einträge
 #define MAX_BUFFER_ENTRIES 1000 // Maximale Anzahl gepufferter Messungen
 
 // ============================================================================

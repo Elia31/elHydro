@@ -77,8 +77,8 @@ void epd_color_fill(epd_color_t* epd, uint8_t color);
 // Setzt ein Pixel im Framebuffer (logische Koordinaten)
 void epd_color_draw_pixel(epd_color_t* epd, int x, int y, uint8_t color);
 
-// Überträgt den kompletten Framebuffer zum Display
-void epd_color_update(epd_color_t* epd);
+// Überträgt den kompletten Framebuffer zum Display (ESP_ERR_TIMEOUT wenn das Display nicht reagiert)
+esp_err_t epd_color_update(epd_color_t* epd);
 
 // Versetzt das Display in den Stromsparmodus
 void epd_color_sleep(epd_color_t* epd);

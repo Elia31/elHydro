@@ -9,6 +9,13 @@ logger = logging.getLogger("Weather")
 # Cache: {(lat, lon): {"data": {...}, "fetched_at": timestamp}}
 _cache = {}
 CACHE_TTL = 1800  # 30 Minuten
+# Zeitlimit pro Anfrage. Der BLE-Worker wartet ohnehin nur kurz auf das Wetter,
+# ein späterer Abruf füllt den Cache für den nächsten Kontakt.
+HTTP_TIMEOUT_S = 5.0
+
+# Geocoding-Cache: {ortsname: (lat, lon)}. Ohne ihn würde jede Messung eines
+# Outdoor-Geräts mit Ortsnamen die Koordinaten neu abfragen.
+_geo_cache = {}
 
 
 async def fetch_weather(lat: float, lon: float) -> dict | None:
@@ -39,7 +46,7 @@ async def fetch_weather(lat: float, lon: float) -> dict | None:
             "timezone": "auto",
         }
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             raw = resp.json()
@@ -81,11 +88,15 @@ async def geocode(location_str: str) -> tuple[float, float] | None:
     Returns:
         (latitude, longitude) oder None
     """
+    key = location_str.strip().lower()
+    if key in _geo_cache:
+        return _geo_cache[key]
+
     try:
         url = "https://geocoding-api.open-meteo.com/v1/search"
         params = {"name": location_str, "count": 1, "language": "de"}
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
             resp = await client.get(url, params=params)
             resp.raise_for_status()
             raw = resp.json()
@@ -93,7 +104,9 @@ async def geocode(location_str: str) -> tuple[float, float] | None:
         results = raw.get("results", [])
         if results:
             r = results[0]
-            return (r["latitude"], r["longitude"])
+            # Nur Treffer merken: Fehler können vorübergehend sein
+            _geo_cache[key] = (r["latitude"], r["longitude"])
+            return _geo_cache[key]
         return None
 
     except Exception as e:

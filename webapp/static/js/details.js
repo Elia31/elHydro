@@ -25,7 +25,8 @@ const Details = {
         try {
             const [device, history] = await Promise.all([
                 App.api(`/devices/${encodeURIComponent(mac)}`),
-                App.api(`/devices/${encodeURIComponent(mac)}/history?limit=200`),
+                // Gleiche Abfrage wie der beim Öffnen markierte Button "Max"
+                App.api(`/devices/${encodeURIComponent(mac)}/history?limit=50000`),
             ]);
 
             const name = device.name || mac;
@@ -551,7 +552,7 @@ const Details = {
             <div class="card weather-card" style="padding:1.25rem;margin-bottom:1rem">
                 <div class="brain-card-title">
                     <svg><use href="#${this.weatherCodeIcon(w.weather_code)}"/></svg>
-                    Wetter - ${this.weatherCodeText(w.weather_code)}${locLabel ? ` · ${locLabel}` : ""}
+                    Wetter - ${this.weatherCodeText(w.weather_code)}${locLabel ? ` · ${this.esc(locLabel)}` : ""}
                 </div>
                 <div class="stats-grid" style="grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); margin-top:0.5rem">
                     <div>
@@ -589,8 +590,17 @@ const Details = {
         const sleepS = m.brain_sleep_s;
         const irrigate = m.brain_irrigate;
         const reasoning = m.brain_reasoning || '';
-        const alerts = m.alerts || [];
+        const alerts = [...(m.alerts || [])];
         const nextWake = device?.next_wake_ts;
+        if (device?.pump_dry) {
+            alerts.unshift({ message: "Letzte Bewässerung ohne Wirkung: Pumpe fördert kein Wasser, Tank prüfen" });
+        }
+
+        const alertsHtml = alerts.length > 0
+            ? `<div style="margin-top:0.75rem">${alerts.map(a =>
+                `<div class="brain-alert-item"><svg><use href="#icon-alert-triangle"/></svg>${this.esc(a.message || a)}</div>`
+              ).join('')}</div>`
+            : '';
 
         if (!sleepS && !reasoning) {
             return `<div class="card brain-card-wrapper" style="padding:1.25rem;opacity:0.6">
@@ -599,24 +609,22 @@ const Details = {
                     Letzte Brain-Entscheidung
                 </div>
                 <div style="color:var(--text-muted);font-size:0.9rem">Noch keine Entscheidung</div>
+                ${alertsHtml}
             </div>`;
         }
 
         const didIrrigate = irrigate === true || irrigate === "True" || irrigate === "true";
 
-        // Offline-Schwelle berechnen (gleiche Formel wie Firmware)
+        // Schwelle ohne Verdunstungszuschlag (gleiche Formel wie Firmware). Das
+        // Vergleichszeichen kommt aus den Werten: Bei Hitze wird auch knapp darüber
+        // gegossen, bei Frost, Cooldown oder Regen trotz Unterschreitung nicht.
         const target = m.target_soil_pct;
         const delta = m.irrigation_start_delta;
         let thresholdLabel = '';
-        if (target != null && delta != null) {
-            const targetMin = Math.max(Math.floor(target * 0.2), 5);
-            const threshold = Math.max(target - delta, targetMin);
+        if (target != null && delta != null && m.soil_pct != null) {
+            const threshold = App.soilThreshold(target, delta);
             const soil = m.soil_pct;
-            if (didIrrigate && soil != null) {
-                thresholdLabel = `Boden ${soil}% < Schwelle ${threshold}%`;
-            } else if (soil != null) {
-                thresholdLabel = `Boden ${soil}% ≥ Schwelle ${threshold}%`;
-            }
+            thresholdLabel = `Boden ${soil}% ${soil < threshold ? '<' : '≥'} Schwelle ${threshold}%`;
         }
 
         const reasonParts = typeof reasoning === 'string'
@@ -628,12 +636,6 @@ const Details = {
                 <div class="brain-reasoning-label">Begründung</div>
                 ${reasonParts.map(r => `<div class="brain-reason-bullet"><span class="dot">•</span><span>${this.esc(r)}</span></div>`).join('')}
                </div>`
-            : '';
-
-        const alertsHtml = alerts.length > 0
-            ? `<div style="margin-top:0.75rem">${alerts.map(a =>
-                `<div class="brain-alert-item"><svg><use href="#icon-alert-triangle"/></svg>${this.esc(a.message || a)}</div>`
-              ).join('')}</div>`
             : '';
 
         const nextWakeHtml = nextWake
@@ -836,7 +838,7 @@ const Details = {
         { key: 'rh', label: 'RH %', tip: 'Relative Luftfeuchtigkeit (HTU21D)', fmt: v => v != null ? Number(v).toFixed(0) + '%' : '-' },
         { key: 'vbat', label: 'Batterie', tip: 'LiPo Spannung (3.0-4.2V)', fmt: v => v != null ? Number(v).toFixed(2) + 'V' : '-' },
         { key: 'irrigated', label: 'Bewässert', tip: 'Ob in diesem Zyklus bewässert wurde', fmt: v => v === true || v === 'True' || v === '1' ? 'Ja' : 'Nein' },
-        { key: 'irrigation_ms', label: 'Dauer', tip: 'Ventil-Öffnungszeit', fmt: v => v ? (v / 1000).toFixed(1) + 's' : '0' },
+        { key: 'irrigation_ms', label: 'Dauer', tip: 'Pumpenlaufzeit', fmt: v => v ? (v / 1000).toFixed(1) + 's' : '0' },
         { key: 'target_soil_pct', label: 'Ziel %', tip: 'Konfigurierte Ziel-Feuchte', fmt: v => v != null ? v + '%' : '-' },
         { key: 'brain_sleep_s', label: 'Schlaf', tip: 'Vom Brain berechnete Schlafzeit', fmt: v => v != null ? App.formatDuration(v) : '-' },
         { key: 'brain_reasoning', label: 'Brain', tip: 'Brain Begründung', extended: false, wrap: true },
@@ -847,7 +849,7 @@ const Details = {
         { key: 'offline_sleep_s', label: 'Offline-Schlaf', tip: 'Schlafzeit wenn ESP32 offline', fmt: v => v != null ? v + 's' : '-' },
         { key: 'calib_dry', label: 'Kal. Trocken', tip: 'ADC bei 0% Feuchte' },
         { key: 'calib_wet', label: 'Kal. Nass', tip: 'ADC bei 100% Feuchte' },
-        { key: 'total_irrigation_ms', label: 'Ges. Bew.', tip: 'Kumulierte Ventil-Öffnungszeit (NVS)', fmt: v => v != null ? (v / 1000).toFixed(0) + 's' : '-' },
+        { key: 'total_irrigation_ms', label: 'Ges. Bew.', tip: 'Kumulierte Pumpenlaufzeit (NVS)', fmt: v => v != null ? (v / 1000).toFixed(0) + 's' : '-' },
         { key: 'total_wakeups', label: 'Wakeups', tip: 'Aufwach-Zyklen seit Factory Reset' },
         { key: 'avg_awake_s', label: 'Ø Wachzeit', tip: 'Durchschn. Wachzeit pro Zyklus', fmt: v => v != null ? Number(v).toFixed(1) + 's' : '-' },
         { key: 'ble_success_pct', label: 'BLE %', tip: 'BLE-Erfolgsrate', fmt: v => v != null ? Number(v).toFixed(0) + '%' : '-' },
@@ -863,7 +865,9 @@ const Details = {
         { key: 'uptime_seconds', label: 'Uptime', tip: 'Seit letztem Powercycle (RTC)', fmt: v => v != null ? App.formatDuration(v) : '-' },
         { key: 'free_heap_bytes', label: 'Heap', tip: 'Verfügbarer Speicher', fmt: v => v != null ? (v / 1024).toFixed(0) + ' KB' : '-' },
         { key: 'reset_reason', label: 'Reset', tip: 'Grund letzter Neustart', fmt: v => v != null ? App.resetReasonText(v) : '-' },
-        { key: 'brain_irrigate', label: 'Brain Bew.', tip: 'Brain empfiehlt Bewässerung', fmt: v => v === true || v === 'True' ? 'Ja' : 'Nein' },
+        { key: 'pump_dry', label: 'Trockenlauf', tip: 'Gegossen, aber die Bodenfeuchte ist nicht gestiegen (Tank leer?)', fmt: v => v === true ? 'Ja' : 'Nein' },
+        // Leer bei gepufferten Messungen, über die das Brain nicht entschieden hat
+        { key: 'brain_irrigate', label: 'Brain Bew.', tip: 'Brain empfiehlt Bewässerung', fmt: v => v == null || v === '' ? '-' : v === true || v === 'True' ? 'Ja' : 'Nein' },
     ],
 
     async loadMessdaten(offset) {
@@ -959,8 +963,6 @@ const Details = {
     },
 
     esc(str) {
-        const d = document.createElement("div");
-        d.textContent = str || "";
-        return d.innerHTML;
+        return App.esc(str);
     },
 };

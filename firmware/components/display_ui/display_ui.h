@@ -75,6 +75,9 @@ void display_ui_show_calibration_success(int raw_dry, int raw_wet);
 // Kalibrierung wegen Timeout abgebrochen
 void display_ui_show_calibration_timeout(void);
 
+// Kalibrierung verworfen (Trocken-/Nasswert unplausibel)
+void display_ui_show_calibration_failed(int raw_dry, int raw_wet);
+
 // Werksreset-Bestätigung anzeigen
 void display_ui_show_factory_reset_confirm(void);
 

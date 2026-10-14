@@ -6,14 +6,20 @@ import sys
 import json
 import shutil
 import socket
-import subprocess
 import threading
 import webbrowser
 import logging
+from logging.handlers import RotatingFileHandler
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 import uvicorn
+
+from src.core.brain import soil_threshold
+from src.utils.constants import (
+    DEFAULT_PRESETS, TARGET_SOIL_MIN, TARGET_SOIL_MAX, IRR_DELTA_MIN, IRR_DELTA_MAX,
+    write_json_atomic,
+)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -70,6 +76,8 @@ else:
     APPDATA_DIR = os.path.join(_xdg_data, "elHydro")
 CONFIG_FILE = os.path.join(APPDATA_DIR, "config", "config.json")
 MUTEX_NAME = "elHydro_Launcher_Mutex"
+# Startargument im Autostart-Eintrag: Server direkt starten, Fenster im Hintergrund
+AUTOSTART_ARG = "--autostart"
 
 DEFAULT_CONFIG = {
     "port": 8000,
@@ -81,15 +89,36 @@ DEFAULT_CONFIG = {
     "autostart": False,
 }
 
+LOG_FILE = os.path.join(APPDATA_DIR, "launcher.log")
+
 log = logging.getLogger("launcher")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+
+
+def _setup_logging():
+    """Loggt in launcher.log und, falls vorhanden, auf die Konsole (die exe hat keine)."""
+    handlers = []
+    if sys.stderr:
+        handlers.append(logging.StreamHandler())
+    try:
+        os.makedirs(APPDATA_DIR, exist_ok=True)
+        handlers.append(RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=2, encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        handlers=handlers or None,
+    )
+
+
+_setup_logging()
 
 
 # ============================================================
 # Hilfsfunktionen
 # ============================================================
 
-def pruefe_einzelinstanz():
+def ensure_single_instance():
     """Verhindert Mehrfachstart. Gibt ein Handle zurück das gehalten werden muss,
     oder beendet das Programm."""
     if IS_WINDOWS:
@@ -112,26 +141,24 @@ def pruefe_einzelinstanz():
     return lock_file
 
 
-def lade_config() -> dict:
+def load_config() -> dict:
     """Lädt die Konfiguration aus dem plattformspezifischen App-Data-Ordner."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                gespeichert = json.load(f)
-            return {**DEFAULT_CONFIG, **gespeichert}
+                saved = json.load(f)
+            return {**DEFAULT_CONFIG, **saved}
         except (json.JSONDecodeError, IOError):
             pass
     return dict(DEFAULT_CONFIG)
 
 
-def speichere_config(cfg: dict):
-    """Speichert die Konfiguration in den plattformspezifischen App-Data-Ordner."""
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+def save_config(cfg: dict):
+    """Speichert die Konfiguration atomar in den plattformspezifischen App-Data-Ordner."""
+    write_json_atomic(CONFIG_FILE, cfg, indent=2)
 
 
-def hole_lokale_ip() -> str:
+def get_local_ip() -> str:
     """Ermittelt die lokale IP-Adresse über einen UDP-Socket-Trick."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -143,7 +170,7 @@ def hole_lokale_ip() -> str:
         return "127.0.0.1"
 
 
-def port_verfuegbar(port: int) -> bool:
+def port_available(port: int) -> bool:
     """Prüft ob der angegebene Port frei ist."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -154,28 +181,28 @@ def port_verfuegbar(port: int) -> bool:
         return False
 
 
-def autostart_setzen(aktivieren: bool):
+def set_autostart(enable: bool):
     """Setzt oder entfernt den Autostart-Eintrag."""
     if IS_WINDOWS:
         try:
             import winreg
-            schluessel = winreg.OpenKey(
+            key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
                 r"Software\Microsoft\Windows\CurrentVersion\Run",
                 0, winreg.KEY_SET_VALUE,
             )
-            if aktivieren:
+            if enable:
                 if getattr(sys, "frozen", False):
-                    pfad = f'"{sys.executable}"'
+                    path = f'"{sys.executable}" {AUTOSTART_ARG}'
                 else:
-                    pfad = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
-                winreg.SetValueEx(schluessel, "elHydro", 0, winreg.REG_SZ, pfad)
+                    path = f'"{sys.executable}" "{os.path.abspath(__file__)}" {AUTOSTART_ARG}'
+                winreg.SetValueEx(key, "elHydro", 0, winreg.REG_SZ, path)
             else:
                 try:
-                    winreg.DeleteValue(schluessel, "elHydro")
+                    winreg.DeleteValue(key, "elHydro")
                 except FileNotFoundError:
                     pass
-            winreg.CloseKey(schluessel)
+            winreg.CloseKey(key)
         except OSError as e:
             log.warning(f"Autostart-Registry konnte nicht geändert werden: {e}")
         return
@@ -186,12 +213,12 @@ def autostart_setzen(aktivieren: bool):
     )
     desktop_file = os.path.join(autostart_dir, "elHydro.desktop")
     try:
-        if aktivieren:
+        if enable:
             os.makedirs(autostart_dir, exist_ok=True)
             if getattr(sys, "frozen", False):
-                exec_cmd = f'"{sys.executable}"'
+                exec_cmd = f'"{sys.executable}" {AUTOSTART_ARG}'
             else:
-                exec_cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+                exec_cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" {AUTOSTART_ARG}'
             content = (
                 "[Desktop Entry]\n"
                 "Type=Application\n"
@@ -207,50 +234,50 @@ def autostart_setzen(aktivieren: bool):
         log.warning(f"Autostart-Datei konnte nicht geändert werden: {e}")
 
 
-def erstelle_qr_bild(url: str, groesse: int = 220):
+def create_qr_image(url: str, size: int = 220):
     """Erzeugt ein QR-Code-Bild als ImageTk.PhotoImage."""
     if not HAS_QR:
         return None
     qr = qrcode.QRCode(version=1, box_size=8, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    bild = qr.make_image(fill_color="black", back_color="white")
-    bild = bild.resize((groesse, groesse), PilImage.NEAREST)
-    return ImageTk.PhotoImage(bild)
+    image = qr.make_image(fill_color="black", back_color="white")
+    image = image.resize((size, size), PilImage.NEAREST)
+    return ImageTk.PhotoImage(image)
 
 
-def daten_verschieben(alter_pfad: str, neuer_pfad: str) -> bool:
+def move_data(old_path: str, new_path: str) -> bool:
     """Verschiebt bestehende Daten vom alten ins neue Verzeichnis.
     Gibt True zurück wenn erfolgreich oder keine Daten vorhanden."""
     # Prüfen ob im alten Verzeichnis überhaupt Daten liegen
-    dateien = ["device_settings.json", "plant_presets.json", "logs.jsonl"]
-    ordner = ["measurements"]
-    hat_daten = any(
-        os.path.exists(os.path.join(alter_pfad, d)) for d in dateien + ordner
+    files = ["device_settings.json", "plant_presets.json", "logs.jsonl"]
+    folders = ["measurements"]
+    has_data = any(
+        os.path.exists(os.path.join(old_path, d)) for d in files + folders
     )
-    if not hat_daten:
+    if not has_data:
         return True
 
-    os.makedirs(neuer_pfad, exist_ok=True)
+    os.makedirs(new_path, exist_ok=True)
     try:
-        for datei in dateien:
-            quelle = os.path.join(alter_pfad, datei)
-            if os.path.exists(quelle):
-                shutil.move(quelle, os.path.join(neuer_pfad, datei))
-        for ordner_name in ordner:
-            quelle = os.path.join(alter_pfad, ordner_name)
-            ziel = os.path.join(neuer_pfad, ordner_name)
-            if os.path.exists(quelle):
-                if os.path.exists(ziel):
+        for file_name in files:
+            source = os.path.join(old_path, file_name)
+            if os.path.exists(source):
+                shutil.move(source, os.path.join(new_path, file_name))
+        for folder_name in folders:
+            source = os.path.join(old_path, folder_name)
+            destination = os.path.join(new_path, folder_name)
+            if os.path.exists(source):
+                if os.path.exists(destination):
                     # Einzelne Dateien verschieben wenn Zielordner existiert
-                    for f in os.listdir(quelle):
-                        shutil.move(os.path.join(quelle, f), os.path.join(ziel, f))
-                    if not os.listdir(quelle):
-                        os.rmdir(quelle)
+                    for f in os.listdir(source):
+                        shutil.move(os.path.join(source, f), os.path.join(destination, f))
+                    if not os.listdir(source):
+                        os.rmdir(source)
                     else:
-                        log.warning(f"Quellordner nicht leer, wird nicht gelöscht: {quelle}")
+                        log.warning(f"Quellordner nicht leer, wird nicht gelöscht: {source}")
                 else:
-                    shutil.move(quelle, ziel)
+                    shutil.move(source, destination)
         return True
     except OSError as e:
         log.error(f"Daten verschieben fehlgeschlagen: {e}")
@@ -258,7 +285,7 @@ def daten_verschieben(alter_pfad: str, neuer_pfad: str) -> bool:
         return False
 
 
-def erstelle_tray_icon_bild():
+def create_tray_icon_image():
     """Lädt das Tropfen-Icon für den System Tray (Fallback: blaues Quadrat)."""
     if not HAS_TRAY:
         return None
@@ -267,8 +294,8 @@ def erstelle_tray_icon_bild():
             return PilImage.open(ICON_PATH).resize((64, 64))
         except Exception:
             pass
-    bild = PilImage.new("RGB", (64, 64), color=(0, 120, 212))
-    return bild
+    image = PilImage.new("RGB", (64, 64), color=(0, 120, 212))
+    return image
 
 
 # ============================================================
@@ -280,7 +307,7 @@ class ElHydroLauncher(tk.Tk):
         super().__init__()
         self.title("elHydro Server Launcher")
         self.resizable(False, False)
-        self.protocol("WM_DELETE_WINDOW", self._bei_schliessen)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Fenster-Icon setzen
         if IS_WINDOWS and os.path.exists(ICON_PATH):
@@ -298,7 +325,7 @@ class ElHydroLauncher(tk.Tk):
                     pass
 
         # Zustandsvariablen
-        self.config_data = lade_config()
+        self.config_data = load_config()
         self.uvicorn_server = None
         self.uvicorn_thread = None
         self.zeroconf_inst = None
@@ -306,59 +333,60 @@ class ElHydroLauncher(tk.Tk):
         self.tray_icon = None
         self.server_url = None
         self._qr_photo = None  # Referenz halten gegen Garbage Collection
-        self._server_start_versuche = 0
+        self._server_start_attempts = 0
+        self._hide_when_started = False
 
         # Tkinter-Variablen
         self.var_port = tk.StringVar(value=str(self.config_data["port"]))
         self.var_data_dir = tk.StringVar(value=self.config_data["data_dir"])
         self.var_mdns = tk.BooleanVar(value=self.config_data["mdns_enabled"])
-        self.var_mdns_modus = tk.StringVar(value=self.config_data["mdns_mode"])
+        self.var_mdns_mode = tk.StringVar(value=self.config_data["mdns_mode"])
         self.var_mdns_name = tk.StringVar(value=self.config_data["mdns_custom_name"])
         self.var_tray = tk.BooleanVar(value=self.config_data["minimize_to_tray"])
         self.var_autostart = tk.BooleanVar(value=self.config_data["autostart"])
 
         # Pflanzen-Presets laden
-        self._plant_presets = self._lade_presets()
+        self._plant_presets = self._load_presets()
 
         # Testdaten-Variablen (spiegeln echte Geräte-Einstellungen)
         self.var_td_name = tk.StringVar(value="Testpflanze")
-        self.var_td_mac = tk.StringVar(value=self._zufaellige_mac())
+        self.var_td_mac = tk.StringVar(value=self._random_mac())
         self.var_td_preset = tk.StringVar(value=self._plant_presets[0]["name"] if self._plant_presets else "Standard (Normal)")
         self.var_td_target = tk.IntVar(value=45)
         self.var_td_delta = tk.IntVar(value=10)
         self.var_td_offline_sleep = tk.IntVar(value=240) # Minuten
-        self.var_td_standort = tk.StringVar(value="indoor")
-        self.var_td_ort = tk.StringVar(value="")
-        self.var_td_eintraege = tk.IntVar(value=200)
+        self.var_td_location_type = tk.StringVar(value="indoor")
+        self.var_td_location = tk.StringVar(value="")
+        self.var_td_entries = tk.IntVar(value=200)
 
         # UI aufbauen
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        self._erstelle_einstellungen()
-        self._erstelle_testdaten_tab()
-        self._erstelle_status()
+        self._build_server_tab()
+        self._build_test_data_tab()
+        self._build_status_view()
 
         # Vorschau und Zustände initial aktualisieren
-        self._aktualisiere_vorschau()
-        self._aktualisiere_mdns_zustand()
+        self._update_preview()
+        self._update_mdns_state()
 
         # Traces für Live-Vorschau
-        self.var_port.trace_add("write", lambda *_: self._aktualisiere_vorschau())
-        self.var_mdns.trace_add("write", lambda *_: self._aktualisiere_mdns_zustand())
-        self.var_mdns_modus.trace_add("write", lambda *_: self._aktualisiere_mdns_zustand())
-        self.var_mdns_name.trace_add("write", lambda *_: self._aktualisiere_vorschau())
+        self.var_port.trace_add("write", lambda *_: self._update_preview())
+        self.var_mdns.trace_add("write", lambda *_: self._update_mdns_state())
+        self.var_mdns_mode.trace_add("write", lambda *_: self._update_mdns_state())
+        self.var_mdns_name.trace_add("write", lambda *_: self._update_preview())
 
     # --- Einstellungen-Frame ---
 
     @staticmethod
-    def _zufaellige_mac():
+    def _random_mac():
         """Erzeugt eine zufällige MAC-Adresse im Dummy-Format."""
         import random
         octets = [random.randint(0, 255) for _ in range(6)]
         return ":".join(f"{b:02X}" for b in octets)
 
-    def _lade_presets(self):
+    def _load_presets(self):
         """Lädt Pflanzen-Presets aus plant_presets.json."""
         presets_path = os.path.join(self.var_data_dir.get(), "plant_presets.json")
         if not os.path.exists(presets_path):
@@ -367,19 +395,15 @@ class ElHydroLauncher(tk.Tk):
             with open(presets_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError, FileNotFoundError):
-            return [
-                {"name": "Standard (Normal)", "target_soil_pct": 45, "sleep_multiplier": 1.0},
-                {"name": "Durstig (Viel Wasser)", "target_soil_pct": 65, "sleep_multiplier": 0.7},
-                {"name": "Sukkulente (Wenig Wasser)", "target_soil_pct": 25, "sleep_multiplier": 1.5},
-            ]
+            return [dict(p) for p in DEFAULT_PRESETS]
 
-    def _erstelle_einstellungen(self):
+    def _build_server_tab(self):
         """Baut den Einstellungen-Frame mit allen Konfigurationsoptionen."""
-        self.frame_einstellungen = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(self.frame_einstellungen, text="Server")
+        self.frame_server = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(self.frame_server, text="Server")
 
         # Port
-        frame_port = ttk.LabelFrame(self.frame_einstellungen, text="Server", padding=10)
+        frame_port = ttk.LabelFrame(self.frame_server, text="Server", padding=10)
         frame_port.pack(fill="x", pady=(0, 10))
 
         row_port = ttk.Frame(frame_port)
@@ -387,54 +411,54 @@ class ElHydroLauncher(tk.Tk):
         ttk.Label(row_port, text="Port:").pack(side="left")
         ttk.Entry(row_port, textvariable=self.var_port, width=8).pack(side="left", padx=(5, 0))
 
-        self.label_port_hinweis = ttk.Label(
+        self.label_port_hint = ttk.Label(
             frame_port, text="Port 80: Kein Port in URL nötig, evtl. Admin-Rechte erforderlich",
             foreground="orange",
         )
         # Wird nur bei Port 80 angezeigt
 
         # Datenverzeichnis
-        frame_daten = ttk.LabelFrame(self.frame_einstellungen, text="Datenverzeichnis", padding=10)
-        frame_daten.pack(fill="x", pady=(0, 10))
+        frame_data = ttk.LabelFrame(self.frame_server, text="Datenverzeichnis", padding=10)
+        frame_data.pack(fill="x", pady=(0, 10))
 
-        row_daten = ttk.Frame(frame_daten)
-        row_daten.pack(fill="x")
-        self.entry_data_dir = ttk.Entry(row_daten, textvariable=self.var_data_dir, width=35)
+        row_data = ttk.Frame(frame_data)
+        row_data.pack(fill="x")
+        self.entry_data_dir = ttk.Entry(row_data, textvariable=self.var_data_dir, width=35)
         self.entry_data_dir.pack(side="left", fill="x", expand=True)
-        ttk.Button(row_daten, text="Durchsuchen...", command=self._datenordner_waehlen).pack(side="left", padx=(5, 0))
+        ttk.Button(row_data, text="Durchsuchen...", command=self._choose_data_dir).pack(side="left", padx=(5, 0))
 
-        row_config_pfad = ttk.Frame(frame_daten)
-        row_config_pfad.pack(fill="x", pady=(5, 0))
-        ttk.Label(row_config_pfad, text="Konfiguration:", foreground="gray").pack(side="left")
-        config_entry = ttk.Entry(row_config_pfad, foreground="gray")
+        row_config_path = ttk.Frame(frame_data)
+        row_config_path.pack(fill="x", pady=(5, 0))
+        ttk.Label(row_config_path, text="Konfiguration:", foreground="gray").pack(side="left")
+        config_entry = ttk.Entry(row_config_path, foreground="gray")
         config_entry.insert(0, CONFIG_FILE)
         config_entry.config(state="readonly")
         config_entry.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
         # mDNS
-        frame_mdns = ttk.LabelFrame(self.frame_einstellungen, text="Netzwerk (mDNS)", padding=10)
+        frame_mdns = ttk.LabelFrame(self.frame_server, text="Netzwerk (mDNS)", padding=10)
         frame_mdns.pack(fill="x", pady=(0, 10))
 
-        zustand = "normal" if HAS_ZEROCONF else "disabled"
+        state = "normal" if HAS_ZEROCONF else "disabled"
         self.check_mdns = ttk.Checkbutton(
-            frame_mdns, text="mDNS aktivieren", variable=self.var_mdns, state=zustand,
+            frame_mdns, text="mDNS aktivieren", variable=self.var_mdns, state=state,
         )
         self.check_mdns.pack(anchor="w")
         if not HAS_ZEROCONF:
             ttk.Label(frame_mdns, text="(zeroconf nicht installiert)", foreground="gray").pack(anchor="w")
 
         self.radio_hostname = ttk.Radiobutton(
-            frame_mdns, text="Hostnamen verwenden", variable=self.var_mdns_modus, value="hostname",
+            frame_mdns, text="Hostnamen verwenden", variable=self.var_mdns_mode, value="hostname",
         )
         self.radio_hostname.pack(anchor="w", padx=(20, 0), pady=(5, 0))
 
         hostname = socket.gethostname()
-        self.label_hostname_vorschau = ttk.Label(frame_mdns, text=f"  \u2192 {hostname}.local:8000", foreground="gray")
-        self.label_hostname_vorschau.pack(anchor="w", padx=(40, 0))
+        self.label_hostname_preview = ttk.Label(frame_mdns, text=f"  \u2192 {hostname}.local:8000", foreground="gray")
+        self.label_hostname_preview.pack(anchor="w", padx=(40, 0))
 
         self.radio_custom = ttk.Radiobutton(
             frame_mdns, text="Eigenen Namen registrieren (Zeroconf)",
-            variable=self.var_mdns_modus, value="custom",
+            variable=self.var_mdns_mode, value="custom",
         )
         self.radio_custom.pack(anchor="w", padx=(20, 0), pady=(5, 0))
 
@@ -444,111 +468,111 @@ class ElHydroLauncher(tk.Tk):
         self.entry_mdns_name = ttk.Entry(row_custom, textvariable=self.var_mdns_name, width=15)
         self.entry_mdns_name.pack(side="left", padx=(5, 0))
 
-        self.label_custom_vorschau = ttk.Label(frame_mdns, text="", foreground="gray")
-        self.label_custom_vorschau.pack(anchor="w", padx=(40, 0))
+        self.label_custom_preview = ttk.Label(frame_mdns, text="", foreground="gray")
+        self.label_custom_preview.pack(anchor="w", padx=(40, 0))
 
         # Tray + Autostart
-        frame_optionen = ttk.LabelFrame(self.frame_einstellungen, text="Optionen", padding=10)
-        frame_optionen.pack(fill="x", pady=(0, 10))
+        frame_options = ttk.LabelFrame(self.frame_server, text="Optionen", padding=10)
+        frame_options.pack(fill="x", pady=(0, 10))
 
-        tray_zustand = "normal" if HAS_TRAY else "disabled"
+        tray_state = "normal" if HAS_TRAY else "disabled"
         self.check_tray = ttk.Checkbutton(
-            frame_optionen, text="Beim Schlie\u00dfen in System Tray minimieren",
-            variable=self.var_tray, state=tray_zustand,
+            frame_options, text="Beim Schlie\u00dfen in System Tray minimieren",
+            variable=self.var_tray, state=tray_state,
         )
         self.check_tray.pack(anchor="w")
         if not HAS_TRAY:
-            ttk.Label(frame_optionen, text="(pystray nicht installiert)", foreground="gray").pack(anchor="w")
+            ttk.Label(frame_options, text="(pystray nicht installiert)", foreground="gray").pack(anchor="w")
 
         self.check_autostart = ttk.Checkbutton(
-            frame_optionen, text="Bei Systemstart automatisch starten",
-            variable=self.var_autostart, command=self._autostart_geaendert,
+            frame_options, text="Bei Systemstart automatisch starten",
+            variable=self.var_autostart, command=self._on_autostart_changed,
         )
         self.check_autostart.pack(anchor="w", pady=(5, 0))
 
         # Extras
-        frame_extras = ttk.LabelFrame(self.frame_einstellungen, text="Extras", padding=10)
+        frame_extras = ttk.LabelFrame(self.frame_server, text="Extras", padding=10)
         frame_extras.pack(fill="x", pady=(0, 10))
 
         self.btn_epaper = ttk.Button(
             frame_extras, text="E-Paper Simulator starten",
-            command=self._epaper_starten,
+            command=self._start_epaper_simulator,
             state="normal" if HAS_EPAPER_SIM else "disabled",
         )
         self.btn_epaper.pack(anchor="w")
         if not HAS_EPAPER_SIM:
-            ttk.Label(frame_extras, text="(epaper_simulator nicht verfuegbar)", foreground="gray").pack(anchor="w")
+            ttk.Label(frame_extras, text="(epaper_simulator nicht verfügbar)", foreground="gray").pack(anchor="w")
 
         # Start-Button
         self.btn_start = ttk.Button(
-            self.frame_einstellungen, text="\u25b6  Server starten", command=self.server_starten,
+            self.frame_server, text="\u25b6  Server starten", command=self.start_server,
         )
         self.btn_start.pack(pady=(10, 0), ipadx=20, ipady=5)
 
     # --- Testdaten-Tab ---
 
-    def _erstelle_testdaten_tab(self):
+    def _build_test_data_tab(self):
         """Baut den Testdaten-Tab — spiegelt die echten Geräte-Einstellungen."""
-        self.frame_testdaten = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(self.frame_testdaten, text="Testdaten")
+        self.frame_test_data = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(self.frame_test_data, text="Testdaten")
 
         # Gerät
-        frame_geraet = ttk.LabelFrame(self.frame_testdaten, text="Gerät", padding=10)
-        frame_geraet.pack(fill="x", pady=(0, 8))
+        frame_device = ttk.LabelFrame(self.frame_test_data, text="Gerät", padding=10)
+        frame_device.pack(fill="x", pady=(0, 8))
 
-        row_name = ttk.Frame(frame_geraet)
+        row_name = ttk.Frame(frame_device)
         row_name.pack(fill="x")
         ttk.Label(row_name, text="Name:").pack(side="left")
         ttk.Entry(row_name, textvariable=self.var_td_name, width=25).pack(side="left", padx=(5, 0))
 
-        row_mac = ttk.Frame(frame_geraet)
+        row_mac = ttk.Frame(frame_device)
         row_mac.pack(fill="x", pady=(5, 0))
         ttk.Label(row_mac, text="MAC:").pack(side="left")
         ttk.Entry(row_mac, textvariable=self.var_td_mac, width=20).pack(side="left", padx=(5, 5))
-        btn_mac_neu = ttk.Button(row_mac, text="Neu", width=4, command=lambda: (
-            self.var_td_mac.set(self._zufaellige_mac()), btn_mac_neu.focus_set(),
+        btn_new_mac = ttk.Button(row_mac, text="Neu", width=4, command=lambda: (
+            self.var_td_mac.set(self._random_mac()), btn_new_mac.focus_set(),
         ))
-        btn_mac_neu.pack(side="left")
+        btn_new_mac.pack(side="left")
 
         # Pflanzentyp (wie in der echten App)
-        frame_pflanze = ttk.LabelFrame(self.frame_testdaten, text="Pflanzentyp", padding=10)
-        frame_pflanze.pack(fill="x", pady=(0, 8))
+        frame_plant = ttk.LabelFrame(self.frame_test_data, text="Pflanzentyp", padding=10)
+        frame_plant.pack(fill="x", pady=(0, 8))
 
-        preset_namen = [p["name"] for p in self._plant_presets]
-        row_preset = ttk.Frame(frame_pflanze)
+        preset_names = [p["name"] for p in self._plant_presets]
+        row_preset = ttk.Frame(frame_plant)
         row_preset.pack(fill="x")
         ttk.Label(row_preset, text="Preset:").pack(side="left")
         self.combo_preset = ttk.Combobox(
             row_preset, textvariable=self.var_td_preset,
-            values=preset_namen, state="readonly", width=25,
+            values=preset_names, state="readonly", width=25,
         )
         self.combo_preset.pack(side="left", padx=(5, 0))
-        self.combo_preset.bind("<<ComboboxSelected>>", self._preset_gewaehlt)
+        self.combo_preset.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
-        row_target = ttk.Frame(frame_pflanze)
+        row_target = ttk.Frame(frame_plant)
         row_target.pack(fill="x", pady=(5, 0))
         ttk.Label(row_target, text="Ziel-Bodenfeuchte:").pack(side="left")
         self.label_td_target = ttk.Label(row_target, text="45%", width=5)
         self.label_td_target.pack(side="right")
         self.scale_td_target = ttk.Scale(
-            row_target, from_=10, to=90, variable=self.var_td_target, orient="horizontal",
+            row_target, from_=TARGET_SOIL_MIN, to=TARGET_SOIL_MAX, variable=self.var_td_target, orient="horizontal",
             command=lambda v: self.label_td_target.config(text=f"{int(float(v))}%"),
         )
         self.scale_td_target.pack(side="left", fill="x", expand=True, padx=(5, 5))
 
-        row_delta = ttk.Frame(frame_pflanze)
+        row_delta = ttk.Frame(frame_plant)
         row_delta.pack(fill="x", pady=(5, 0))
         ttk.Label(row_delta, text="Bewässerungs-Delta:").pack(side="left")
         self.label_td_delta = ttk.Label(row_delta, text="10%", width=5)
         self.label_td_delta.pack(side="right")
         ttk.Scale(
-            row_delta, from_=5, to=50, variable=self.var_td_delta, orient="horizontal",
+            row_delta, from_=IRR_DELTA_MIN, to=IRR_DELTA_MAX, variable=self.var_td_delta, orient="horizontal",
             command=lambda v: self.label_td_delta.config(text=f"{int(float(v))}%"),
         ).pack(side="left", fill="x", expand=True, padx=(5, 5))
-        self.label_td_threshold = ttk.Label(frame_pflanze, text="", foreground="gray")
+        self.label_td_threshold = ttk.Label(frame_plant, text="", foreground="gray")
         self.label_td_threshold.pack(anchor="w", pady=(2, 0))
         ttk.Label(
-            frame_pflanze,
+            frame_plant,
             text="Gilt online und offline — bei Hitze und Trockenheit auch früher",
             foreground="gray",
         ).pack(anchor="w", pady=(2, 0))
@@ -557,7 +581,7 @@ class ElHydroLauncher(tk.Tk):
         self._update_td_threshold()
 
         # ESP32 Offline-Modus
-        frame_offline = ttk.LabelFrame(self.frame_testdaten, text="ESP32 Offline-Modus", padding=10)
+        frame_offline = ttk.LabelFrame(self.frame_test_data, text="ESP32 Offline-Modus", padding=10)
         frame_offline.pack(fill="x", pady=(0, 8))
 
         row_offline = ttk.Frame(frame_offline)
@@ -567,47 +591,47 @@ class ElHydroLauncher(tk.Tk):
         ttk.Label(row_offline, text="Min.", foreground="gray").pack(side="left")
 
         # Standort (wie in der echten App)
-        frame_standort = ttk.LabelFrame(self.frame_testdaten, text="Standort", padding=10)
-        frame_standort.pack(fill="x", pady=(0, 8))
+        frame_location = ttk.LabelFrame(self.frame_test_data, text="Standort", padding=10)
+        frame_location.pack(fill="x", pady=(0, 8))
 
-        row_typ = ttk.Frame(frame_standort)
-        row_typ.pack(fill="x")
-        ttk.Radiobutton(row_typ, text="Indoor", variable=self.var_td_standort,
-                         value="indoor", command=self._standort_geaendert).pack(side="left")
-        ttk.Radiobutton(row_typ, text="Outdoor", variable=self.var_td_standort,
-                         value="outdoor", command=self._standort_geaendert).pack(side="left", padx=(15, 0))
+        row_type = ttk.Frame(frame_location)
+        row_type.pack(fill="x")
+        ttk.Radiobutton(row_type, text="Indoor", variable=self.var_td_location_type,
+                         value="indoor", command=self._on_location_type_changed).pack(side="left")
+        ttk.Radiobutton(row_type, text="Outdoor", variable=self.var_td_location_type,
+                         value="outdoor", command=self._on_location_type_changed).pack(side="left", padx=(15, 0))
 
-        self.frame_td_ort = ttk.Frame(frame_standort)
-        ttk.Label(self.frame_td_ort, text="Ort:").pack(side="left")
-        ttk.Entry(self.frame_td_ort, textvariable=self.var_td_ort, width=20).pack(side="left", padx=(5, 0))
-        ttk.Label(self.frame_td_ort, text="(Stadt oder Koordinaten)", foreground="gray").pack(side="left", padx=(5, 0))
+        self.frame_td_location = ttk.Frame(frame_location)
+        ttk.Label(self.frame_td_location, text="Ort:").pack(side="left")
+        ttk.Entry(self.frame_td_location, textvariable=self.var_td_location, width=20).pack(side="left", padx=(5, 0))
+        ttk.Label(self.frame_td_location, text="(Stadt oder Koordinaten)", foreground="gray").pack(side="left", padx=(5, 0))
         # Nur bei Outdoor sichtbar
-        self._standort_geaendert()
+        self._on_location_type_changed()
 
         # Datenmenge
-        frame_menge = ttk.LabelFrame(self.frame_testdaten, text="Datenmenge", padding=10)
-        frame_menge.pack(fill="x", pady=(0, 8))
+        frame_amount = ttk.LabelFrame(self.frame_test_data, text="Datenmenge", padding=10)
+        frame_amount.pack(fill="x", pady=(0, 8))
 
-        row_menge = ttk.Frame(frame_menge)
-        row_menge.pack(fill="x")
-        ttk.Label(row_menge, text="Anzahl Einträge:").pack(side="left")
+        row_amount = ttk.Frame(frame_amount)
+        row_amount.pack(fill="x")
+        ttk.Label(row_amount, text="Anzahl Einträge:").pack(side="left")
         ttk.Spinbox(
-            row_menge, from_=10, to=5000, textvariable=self.var_td_eintraege, width=8,
+            row_amount, from_=10, to=5000, textvariable=self.var_td_entries, width=8,
         ).pack(side="left", padx=(5, 0))
 
         # Generieren-Button + Status
-        frame_aktion = ttk.Frame(self.frame_testdaten)
-        frame_aktion.pack(fill="x", pady=(5, 0))
+        frame_action = ttk.Frame(self.frame_test_data)
+        frame_action.pack(fill="x", pady=(5, 0))
 
-        self.btn_generieren = ttk.Button(
-            frame_aktion, text="Testdaten generieren", command=self._testdaten_generieren,
+        self.btn_generate = ttk.Button(
+            frame_action, text="Testdaten generieren", command=self._generate_test_data,
         )
-        self.btn_generieren.pack(ipadx=15, ipady=4)
+        self.btn_generate.pack(ipadx=15, ipady=4)
 
-        self.label_td_status = ttk.Label(frame_aktion, text="", foreground="gray")
+        self.label_td_status = ttk.Label(frame_action, text="", foreground="gray")
         self.label_td_status.pack(pady=(5, 0))
 
-    def _preset_gewaehlt(self, event=None):
+    def _on_preset_selected(self, event=None):
         """Aktualisiert Target wenn ein Preset gewählt wird."""
         name = self.var_td_preset.get()
         for preset in self._plant_presets:
@@ -618,32 +642,44 @@ class ElHydroLauncher(tk.Tk):
 
     def _update_td_threshold(self):
         """Berechnet die Bewässerungs-Schwelle live (gleiche Formel wie Brain + Firmware)."""
-        target = self.var_td_target.get()
-        delta = self.var_td_delta.get()
-        target_min = max(int(target * 0.2), 5)
-        threshold = max(target - delta, target_min)
+        threshold = soil_threshold(self.var_td_target.get(), self.var_td_delta.get())
         self.label_td_threshold.config(
             text=f"Bewässerung startet spätestens bei {threshold}% Bodenfeuchte"
         )
 
-    def _standort_geaendert(self):
+    def _on_location_type_changed(self):
         """Zeigt/versteckt das Ort-Feld je nach Indoor/Outdoor."""
-        if self.var_td_standort.get() == "outdoor":
-            self.frame_td_ort.pack(fill="x", pady=(5, 0))
+        if self.var_td_location_type.get() == "outdoor":
+            self.frame_td_location.pack(fill="x", pady=(5, 0))
         else:
-            self.frame_td_ort.pack_forget()
+            self.frame_td_location.pack_forget()
 
-    def _testdaten_generieren(self):
+    def _generate_test_data(self):
         """Startet die Testdaten-Generierung in einem Thread."""
-        self.btn_generieren.config(state="disabled", text="Generiere...")
+        # Zahlenfelder zuerst prüfen: Bei ungültiger Eingabe wirft Tk einen Fehler,
+        # und der Button bliebe sonst auf "Generiere..." stehen
+        try:
+            offline_min = self.var_td_offline_sleep.get()
+            count = self.var_td_entries.get()
+        except tk.TclError:
+            offline_min = count = None
+        if offline_min is None or count is None or not (10 <= offline_min <= 1440) or not (10 <= count <= 5000):
+            self.label_td_status.config(
+                text="Offline Sleep: 10 bis 1440 Minuten, Anzahl: 10 bis 5000", foreground="red",
+            )
+            return
+
+        self.btn_generate.config(state="disabled", text="Generiere...")
         self.label_td_status.config(text="", foreground="gray")
 
-        # Sleep-Multiplier aus Preset holen
+        # Sleep-Multiplier und id aus dem gewählten Preset holen
         multiplier = 1.0
+        preset_id = None
         preset_name = self.var_td_preset.get()
         for preset in self._plant_presets:
             if preset["name"] == preset_name:
                 multiplier = preset.get("sleep_multiplier", 1.0)
+                preset_id = preset.get("id")
                 break
 
         config = {
@@ -651,42 +687,44 @@ class ElHydroLauncher(tk.Tk):
             "mac": self.var_td_mac.get(),
             "target_soil_pct": self.var_td_target.get(),
             "irrigation_start_delta": self.var_td_delta.get(),
-            "offline_sleep_s": self.var_td_offline_sleep.get() * 60,
+            "offline_sleep_s": offline_min * 60,
             "plant_multiplier": multiplier,
-            "plant_type": preset_name,
-            "num_entries": self.var_td_eintraege.get(),
-            "location_type": self.var_td_standort.get(),
-            "location": self.var_td_ort.get() if self.var_td_standort.get() == "outdoor" else None,
+            "preset_id": preset_id,
+            "num_entries": count,
+            "location_type": self.var_td_location_type.get(),
+            "location": self.var_td_location.get() if self.var_td_location_type.get() == "outdoor" else None,
             "data_dir": self.var_data_dir.get(),
         }
 
         def _run():
             try:
                 from tools.generate_dummy_data import generate_device_data
-                pfad, anzahl = generate_device_data(config)
-                self.after(0, lambda: self._testdaten_fertig(pfad, anzahl))
+                path, count = generate_device_data(config)
+                self.after(0, lambda: self._on_test_data_done(path, count))
             except Exception as e:
-                self.after(0, lambda: self._testdaten_fehler(str(e)))
+                # e existiert nach dem except-Block nicht mehr, der Callback läuft aber später
+                error = str(e)
+                self.after(0, lambda: self._on_test_data_error(error))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _testdaten_fertig(self, pfad: str, anzahl: int = 0):
+    def _on_test_data_done(self, path: str, count: int = 0):
         """Callback wenn Testdaten erfolgreich erstellt wurden."""
-        self.btn_generieren.config(state="normal", text="Testdaten generieren")
+        self.btn_generate.config(state="normal", text="Testdaten generieren")
         self.label_td_status.config(
-            text=f"Erstellt: {anzahl} Einträge in {os.path.basename(pfad)}", foreground="green",
+            text=f"Erstellt: {count} Einträge in {os.path.basename(path)}", foreground="green",
         )
         # Neue MAC für nächsten Durchlauf
-        self.var_td_mac.set(self._zufaellige_mac())
+        self.var_td_mac.set(self._random_mac())
 
-    def _testdaten_fehler(self, fehler: str):
+    def _on_test_data_error(self, error: str):
         """Callback wenn Testdaten-Generierung fehlschlägt."""
-        self.btn_generieren.config(state="normal", text="Testdaten generieren")
-        self.label_td_status.config(text=f"Fehler: {fehler}", foreground="red")
+        self.btn_generate.config(state="normal", text="Testdaten generieren")
+        self.label_td_status.config(text=f"Fehler: {error}", foreground="red")
 
     # --- E-Paper Simulator ---
 
-    def _epaper_starten(self):
+    def _start_epaper_simulator(self):
         """Startet den E-Paper Simulator als integriertes Toplevel-Fenster."""
         try:
             epaper_start_embedded(self)
@@ -696,7 +734,7 @@ class ElHydroLauncher(tk.Tk):
 
     # --- Status-Frame ---
 
-    def _erstelle_status(self):
+    def _build_status_view(self):
         """Baut den Status-Frame (nach Server-Start sichtbar)."""
         self.frame_status = ttk.Frame(self, padding=15)
         # Wird erst nach Start eingeblendet
@@ -716,13 +754,13 @@ class ElHydroLauncher(tk.Tk):
         self.btn_browser.pack(pady=(0, 5), ipadx=10, ipady=3)
 
         self.btn_stop = ttk.Button(
-            self.frame_status, text="\u25a0  Server stoppen", command=self.server_stoppen,
+            self.frame_status, text="\u25a0  Server stoppen", command=self.stop_server,
         )
         self.btn_stop.pack(pady=(5, 0), ipadx=10, ipady=3)
 
     # --- Vorschau-Aktualisierung ---
 
-    def _aktualisiere_vorschau(self):
+    def _update_preview(self):
         """Aktualisiert die URL-Vorschauen basierend auf den aktuellen Einstellungen."""
         try:
             port = int(self.var_port.get())
@@ -731,70 +769,73 @@ class ElHydroLauncher(tk.Tk):
 
         # Port-80-Hinweis
         if port == 80:
-            self.label_port_hinweis.pack(anchor="w", pady=(5, 0))
+            self.label_port_hint.pack(anchor="w", pady=(5, 0))
         else:
-            self.label_port_hinweis.pack_forget()
+            self.label_port_hint.pack_forget()
 
         port_suffix = "" if port == 80 else f":{port}"
         hostname = socket.gethostname()
         name = self.var_mdns_name.get() or "elhydro"
 
-        self.label_hostname_vorschau.config(text=f"  \u2192 {hostname}.local{port_suffix}")
-        self.label_custom_vorschau.config(text=f"  \u2192 {name}.local{port_suffix}")
+        self.label_hostname_preview.config(text=f"  \u2192 {hostname}.local{port_suffix}")
+        self.label_custom_preview.config(text=f"  \u2192 {name}.local{port_suffix}")
 
-    def _aktualisiere_mdns_zustand(self):
+    def _update_mdns_state(self):
         """Aktiviert/deaktiviert mDNS-Widgets je nach Checkbox-Status."""
-        aktiv = self.var_mdns.get() and HAS_ZEROCONF
-        zustand = "normal" if aktiv else "disabled"
-        self.radio_hostname.config(state=zustand)
-        self.radio_custom.config(state=zustand)
+        active = self.var_mdns.get() and HAS_ZEROCONF
+        state = "normal" if active else "disabled"
+        self.radio_hostname.config(state=state)
+        self.radio_custom.config(state=state)
 
-        custom_aktiv = aktiv and self.var_mdns_modus.get() == "custom"
-        self.entry_mdns_name.config(state="normal" if custom_aktiv else "disabled")
+        custom_active = active and self.var_mdns_mode.get() == "custom"
+        self.entry_mdns_name.config(state="normal" if custom_active else "disabled")
 
-        self._aktualisiere_vorschau()
+        self._update_preview()
 
-    def _datenordner_waehlen(self):
+    def _choose_data_dir(self):
         """Öffnet einen Ordner-Auswahl-Dialog und bietet an, bestehende Daten zu verschieben."""
-        neuer_pfad = filedialog.askdirectory(
+        new_path = filedialog.askdirectory(
             title="Datenverzeichnis wählen",
             initialdir=self.var_data_dir.get(),
         )
-        if not neuer_pfad:
+        if not new_path:
             return
 
-        alter_pfad = self.var_data_dir.get()
-        if os.path.normpath(neuer_pfad) == os.path.normpath(alter_pfad):
+        old_path = self.var_data_dir.get()
+        if os.path.normpath(new_path) == os.path.normpath(old_path):
             return
 
         # Prüfen ob im alten Ordner Daten liegen die verschoben werden können
-        dateien = ["device_settings.json", "plant_presets.json", "logs.jsonl"]
-        ordner = ["measurements"]
-        hat_daten = any(
-            os.path.exists(os.path.join(alter_pfad, d)) for d in dateien + ordner
+        files = ["device_settings.json", "plant_presets.json", "logs.jsonl"]
+        folders = ["measurements"]
+        has_data = any(
+            os.path.exists(os.path.join(old_path, d)) for d in files + folders
         )
 
-        if hat_daten:
-            antwort = messagebox.askyesno(
+        if has_data:
+            answer = messagebox.askyesno(
                 "Datenverzeichnis ändern",
-                f"Bestehende Daten nach\n{neuer_pfad}\nverschieben?",
+                f"Bestehende Daten nach\n{new_path}\nverschieben?",
             )
-            if antwort:
-                if not daten_verschieben(alter_pfad, neuer_pfad):
+            if answer:
+                if not move_data(old_path, new_path):
                     return  # Verschieben fehlgeschlagen, Pfad nicht ändern
 
-        self.var_data_dir.set(neuer_pfad)
+        self.var_data_dir.set(new_path)
         # Config sofort speichern damit der neue Pfad nicht verloren geht
-        self.config_data = self._config_aus_ui()
-        speichere_config(self.config_data)
+        self.config_data = self._config_from_ui()
+        save_config(self.config_data)
 
-    def _autostart_geaendert(self):
+    def _on_autostart_changed(self):
         """Wird aufgerufen wenn die Autostart-Checkbox geändert wird."""
-        autostart_setzen(self.var_autostart.get())
+        set_autostart(self.var_autostart.get())
+        # Sofort speichern, sonst zeigt die Checkbox nach einem Neustart den alten Stand
+        self.config_data = self._config_from_ui()
+        save_config(self.config_data)
 
     # --- Config lesen/schreiben ---
 
-    def _config_aus_ui(self) -> dict:
+    def _config_from_ui(self) -> dict:
         """Liest die aktuellen UI-Werte in ein Config-Dict."""
         try:
             port = int(self.var_port.get())
@@ -804,7 +845,7 @@ class ElHydroLauncher(tk.Tk):
             "port": port,
             "data_dir": self.var_data_dir.get(),
             "mdns_enabled": self.var_mdns.get(),
-            "mdns_mode": self.var_mdns_modus.get(),
+            "mdns_mode": self.var_mdns_mode.get(),
             "mdns_custom_name": self.var_mdns_name.get(),
             "minimize_to_tray": self.var_tray.get(),
             "autostart": self.var_autostart.get(),
@@ -812,8 +853,9 @@ class ElHydroLauncher(tk.Tk):
 
     # --- Server starten/stoppen ---
 
-    def server_starten(self):
-        """Validiert Einstellungen und startet den Uvicorn-Server in einem Thread."""
+    def start_server(self, hide=False):
+        """Validiert Einstellungen und startet den Uvicorn-Server in einem Thread.
+        hide: Fenster nach dem Start in den Tray legen bzw. minimieren (Autostart)."""
         # Port validieren
         try:
             port = int(self.var_port.get())
@@ -823,21 +865,18 @@ class ElHydroLauncher(tk.Tk):
             messagebox.showerror("Fehler", "Bitte einen gültigen Port (1-65535) eingeben.")
             return
 
-        if not port_verfuegbar(port):
+        if not port_available(port):
             messagebox.showerror("Fehler", f"Port {port} ist bereits belegt.")
             return
 
         # Config speichern
-        self.config_data = self._config_aus_ui()
-        speichere_config(self.config_data)
+        self.config_data = self._config_from_ui()
+        save_config(self.config_data)
 
         # Datenverzeichnis erstellen und Umgebungsvariable setzen
         data_dir = self.config_data["data_dir"]
         os.makedirs(data_dir, exist_ok=True)
         os.environ["ELHYDRO_DATA_DIR"] = data_dir
-
-        # Arbeitsverzeichnis setzen (main.py nutzt relative Pfade für static/)
-        os.chdir(SCRIPT_DIR)
 
         # Gecachte Module entfernen damit DataManager beim Neustart
         # frische Daten aus device_settings.json / measurements/ lädt
@@ -857,26 +896,38 @@ class ElHydroLauncher(tk.Tk):
 
         self.uvicorn_thread = threading.Thread(target=self.uvicorn_server.run, daemon=True)
         self.uvicorn_thread.start()
+        self._hide_when_started = hide
 
         # UI deaktivieren während wir auf den Server warten
         self.btn_start.config(state="disabled", text="Starte...")
-        self._server_start_versuche = 0
-        self._warte_auf_server()
+        self._server_start_attempts = 0
+        self._wait_for_server()
 
-    def _warte_auf_server(self):
+    def _wait_for_server(self):
         """Pollt den Server-Status und wechselt zur Status-Ansicht wenn bereit."""
         if self.uvicorn_server and self.uvicorn_server.started:
-            self._server_gestartet()
-        elif self._server_start_versuche >= 50:  # ~10 Sekunden bei 200ms
-            log.error("Server-Start Timeout nach 10 Sekunden")
-            messagebox.showerror("Fehler", "Server konnte nicht gestartet werden.\nSiehe Log-Datei für Details.")
-            self.btn_start.config(state="normal", text="\u25b6  Server starten")
-            self._server_start_versuche = 0
-        else:
-            self._server_start_versuche += 1
-            self.after(200, self._warte_auf_server)
+            self._on_server_started()
+            return
 
-    def _server_gestartet(self):
+        # Beendeter Thread heißt: Start fehlgeschlagen (z.B. Port belegt, Importfehler),
+        # dann nicht erst die vollen 10 Sekunden warten
+        thread_ended = not self.uvicorn_thread.is_alive()
+        if thread_ended or self._server_start_attempts >= 50:  # ~10 Sekunden bei 200ms
+            if thread_ended:
+                log.error("Server-Thread beim Start beendet")
+            else:
+                log.error("Server-Start Timeout nach 10 Sekunden")
+                self.uvicorn_server.should_exit = True
+            self.uvicorn_server = None
+            self.uvicorn_thread = None
+            messagebox.showerror("Fehler", f"Server konnte nicht gestartet werden.\nDetails stehen in:\n{LOG_FILE}")
+            self.btn_start.config(state="normal", text="\u25b6  Server starten")
+            self._server_start_attempts = 0
+        else:
+            self._server_start_attempts += 1
+            self.after(200, self._wait_for_server)
+
+    def _on_server_started(self):
         """Wird aufgerufen sobald der Server bereit ist."""
         port = self.config_data["port"]
         port_suffix = "" if port == 80 else f":{port}"
@@ -889,18 +940,18 @@ class ElHydroLauncher(tk.Tk):
             else:
                 host = f"{socket.gethostname()}.local"
         else:
-            host = hole_lokale_ip()
+            host = get_local_ip()
 
         self.server_url = f"http://{host}{port_suffix}"
 
         # Zeroconf registrieren
-        self._zeroconf_registrieren()
+        self._register_zeroconf()
 
         # Status-UI anzeigen
         self.label_status.config(text=f"\u2713 Server läuft auf\n{self.server_url}")
 
         # QR-Code erzeugen
-        self._qr_photo = erstelle_qr_bild(self.server_url)
+        self._qr_photo = create_qr_image(self.server_url)
         if self._qr_photo:
             self.label_qr.config(image=self._qr_photo)
         else:
@@ -912,13 +963,20 @@ class ElHydroLauncher(tk.Tk):
 
         # System Tray erstellen
         if self.config_data["minimize_to_tray"] and HAS_TRAY:
-            self._tray_erstellen()
+            self._create_tray_icon()
+
+        # Beim Autostart läuft der Server im Hintergrund weiter
+        if self._hide_when_started:
+            if self.tray_icon:
+                self.withdraw()
+            else:
+                self.iconify()
 
         log.info(f"Server gestartet: {self.server_url}")
 
-    def server_stoppen(self):
+    def stop_server(self):
         """Stoppt den Server und kehrt zur Einstellungen-Ansicht zurück."""
-        self._zeroconf_abmelden()
+        self._unregister_zeroconf()
 
         if self.uvicorn_server:
             self.uvicorn_server.should_exit = True
@@ -941,7 +999,7 @@ class ElHydroLauncher(tk.Tk):
 
     # --- Zeroconf ---
 
-    def _zeroconf_registrieren(self):
+    def _register_zeroconf(self):
         """Registriert den mDNS-Service wenn aktiviert und im Custom-Modus."""
         if not HAS_ZEROCONF:
             return
@@ -952,7 +1010,7 @@ class ElHydroLauncher(tk.Tk):
 
         name = self.config_data.get("mdns_custom_name", "elhydro")
         port = self.config_data.get("port", 8000)
-        ip = hole_lokale_ip()
+        ip = get_local_ip()
 
         try:
             self.zeroconf_info = ServiceInfo(
@@ -973,7 +1031,7 @@ class ElHydroLauncher(tk.Tk):
         except Exception as e:
             log.warning(f"Zeroconf-Registrierung fehlgeschlagen: {e}")
 
-    def _zeroconf_abmelden(self):
+    def _unregister_zeroconf(self):
         """Meldet den mDNS-Service ab und schließt Zeroconf."""
         if self.zeroconf_inst:
             try:
@@ -986,25 +1044,25 @@ class ElHydroLauncher(tk.Tk):
 
     # --- System Tray ---
 
-    def _tray_erstellen(self):
+    def _create_tray_icon(self):
         """Erstellt das System-Tray-Icon mit Kontextmenü."""
         if not HAS_TRAY or self.tray_icon:
             return
 
-        icon_bild = erstelle_tray_icon_bild()
+        icon_image = create_tray_icon_image()
         menu = pystray.Menu(
-            pystray.MenuItem("Fenster öffnen", lambda: self.after(0, self._fenster_zeigen), default=True),
+            pystray.MenuItem("Fenster öffnen", lambda: self.after(0, self._show_window), default=True),
             pystray.MenuItem(
                 "Dashboard im Browser öffnen",
                 lambda: webbrowser.open(self.server_url) if self.server_url else None,
             ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Beenden", lambda: self.after(0, self.beenden)),
+            pystray.MenuItem("Beenden", lambda: self.after(0, self.shutdown)),
         )
-        self.tray_icon = pystray.Icon("elHydro", icon_bild, "elHydro Server", menu)
+        self.tray_icon = pystray.Icon("elHydro", icon_image, "elHydro Server", menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
-    def _fenster_zeigen(self):
+    def _show_window(self):
         """Stellt das Fenster aus dem System Tray wieder her."""
         self.deiconify()
         self.lift()
@@ -1012,18 +1070,18 @@ class ElHydroLauncher(tk.Tk):
 
     # --- Fenster schließen / Beenden ---
 
-    def _bei_schliessen(self):
+    def _on_close(self):
         """WM_DELETE_WINDOW Handler: In Tray minimieren oder komplett beenden."""
         if self.server_url and self.config_data.get("minimize_to_tray") and HAS_TRAY:
             self.withdraw()
         else:
-            self.beenden()
+            self.shutdown()
 
-    def beenden(self):
+    def shutdown(self):
         """Fährt alles sauber herunter: Zeroconf, Uvicorn, Tray, Fenster."""
         log.info("Beende elHydro Launcher...")
 
-        self._zeroconf_abmelden()
+        self._unregister_zeroconf()
 
         if self.uvicorn_server:
             self.uvicorn_server.should_exit = True
@@ -1042,7 +1100,14 @@ class ElHydroLauncher(tk.Tk):
 
 if __name__ == "__main__":
     # Einzelinstanz sicherstellen
-    _mutex = pruefe_einzelinstanz()
+    _mutex = ensure_single_instance()
 
     app = ElHydroLauncher()
+    # Autostart-Eintrag auffrischen: aktueller Pfad und Startargument, auch wenn
+    # er von einer älteren Version oder einem anderen Speicherort stammt
+    if app.config_data["autostart"]:
+        set_autostart(True)
+    # Beim Systemstart gleich den Server starten, damit die Knoten ohne Klick einen Host haben
+    if AUTOSTART_ARG in sys.argv[1:]:
+        app.after(0, lambda: app.start_server(hide=True))
     app.mainloop()

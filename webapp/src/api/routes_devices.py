@@ -1,7 +1,13 @@
 # src/api/routes_devices.py
 # REST-Endpunkte für Geräteverwaltung: Einstellungen lesen, ändern und Geräte entfernen.
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+from src.utils.constants import (
+    load_plant_presets, TARGET_SOIL_MIN, TARGET_SOIL_MAX, IRR_DELTA_MIN, IRR_DELTA_MAX,
+)
 
 router = APIRouter()
 
@@ -9,21 +15,36 @@ router = APIRouter()
 data_manager = None
 
 
+# BLE-Adresse wie von bleak geliefert: MAC (Windows/Linux) oder UUID (macOS).
+# Sie dient auch als Dateiname der Mess-CSV, deshalb nur dieses Format zulassen.
+BLE_ADDRESS_PATTERN = (
+    r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"
+    r"|^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$"
+)
+
+
 class DeviceCreate(BaseModel):
-    mac: str
+    mac: str = Field(pattern=BLE_ADDRESS_PATTERN)
     name: str
-    plant_type: str
+    preset_id: str
     is_outdoor: bool
     location: str | None = None
 
 
 class DeviceSettings(BaseModel):
-    target_soil_pct: int | None = Field(None, ge=0, le=100)
-    irrigation_start_delta: int | None = Field(None, ge=0, le=100)
-    offline_sleep_s: int | None = Field(None, ge=0, le=4294967295)
-    plant_type: str | None = None
-    type: str | None = None
+    # Gleiche Grenzen wie Dashboard und Launcher (constants.py)
+    target_soil_pct: int | None = Field(None, ge=TARGET_SOIL_MIN, le=TARGET_SOIL_MAX)
+    irrigation_start_delta: int | None = Field(None, ge=IRR_DELTA_MIN, le=IRR_DELTA_MAX)
+    # Gleiche Grenzen wie die Firmware: 10 min bis 24 h
+    offline_sleep_s: int | None = Field(None, ge=600, le=86400)
+    preset_id: str | None = None
+    type: Literal["indoor", "outdoor"] | None = None
     location: str | None = None
+
+
+def _check_preset(preset_id):
+    if not any(p.get("id") == preset_id for p in load_plant_presets()):
+        raise HTTPException(status_code=422, detail="Unbekanntes Preset")
 
 
 @router.get("/devices")
@@ -56,10 +77,11 @@ def get_device(mac: str):
 
 @router.post("/devices")
 def add_device(body: DeviceCreate):
+    _check_preset(body.preset_id)
     data_manager.add_or_update_device(
         mac=body.mac,
         name=body.name,
-        plant_type=body.plant_type,
+        preset_id=body.preset_id,
         is_outdoor=body.is_outdoor,
         location=body.location,
     )
@@ -71,6 +93,9 @@ def update_settings(mac: str, body: DeviceSettings):
     dev = data_manager.get_device(mac)
     if not dev:
         raise HTTPException(status_code=404, detail="Gerät nicht gefunden")
+    # Ein inzwischen gelöschtes Preset darf stehen bleiben, nur neue werden geprüft
+    if body.preset_id is not None and body.preset_id != dev.get("preset_id"):
+        _check_preset(body.preset_id)
 
     # Config-Werte als pending queuen
     if body.target_soil_pct is not None:
@@ -80,13 +105,9 @@ def update_settings(mac: str, body: DeviceSettings):
     if body.offline_sleep_s is not None:
         data_manager.update_and_queue(mac, "offline_sleep_s", body.offline_sleep_s)
     # Metadaten direkt aktualisieren
-    if body.plant_type is not None:
-        data_manager.settings[mac]["plant_type"] = body.plant_type
-    if body.type is not None:
-        data_manager.settings[mac]["type"] = body.type
-    if body.location is not None:
-        data_manager.settings[mac]["location"] = body.location
-    data_manager.save_settings()
+    data_manager.update_device(
+        mac, **body.model_dump(include={"preset_id", "type", "location"}, exclude_none=True)
+    )
 
     return {"status": "ok"}
 
@@ -100,8 +121,7 @@ def update_notes(mac: str, body: DeviceNotes):
     dev = data_manager.get_device(mac)
     if not dev:
         raise HTTPException(status_code=404, detail="Gerät nicht gefunden")
-    data_manager.settings[mac]["notes"] = body.notes
-    data_manager.save_settings()
+    data_manager.update_device(mac, notes=body.notes)
     return {"status": "ok"}
 
 

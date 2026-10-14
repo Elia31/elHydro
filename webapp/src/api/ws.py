@@ -29,7 +29,8 @@ class ConnectionManager:
         """Sendet ein Event an alle verbundenen Clients."""
         message = json.dumps({"event": event, "data": data}, default=str)
         disconnected = []
-        for ws in self.active:
+        # Kopie, weil sich die Liste während der awaits ändern kann
+        for ws in list(self.active):
             try:
                 await ws.send_text(message)
             except Exception:

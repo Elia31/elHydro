@@ -75,8 +75,8 @@ void epd_bwr_fill(epd_bwr_t* epd, uint8_t color);
 // Setzt ein Pixel im Framebuffer (logische Koordinaten)
 void epd_bwr_draw_pixel(epd_bwr_t* epd, int x, int y, uint8_t color);
 
-// Überträgt beide Framebuffer zum Display (vollständiges Update)
-void epd_bwr_update(epd_bwr_t* epd);
+// Überträgt beide Framebuffer zum Display (vollständiges Update, ESP_ERR_TIMEOUT wenn das Display nicht reagiert)
+esp_err_t epd_bwr_update(epd_bwr_t* epd);
 
 // Partielles Update eines Bereichs
 void epd_bwr_update_window(epd_bwr_t* epd, uint16_t x, uint16_t y, uint16_t w, uint16_t h);

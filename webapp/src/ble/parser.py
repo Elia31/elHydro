@@ -38,14 +38,19 @@ class MeasurementParser:
         uint32_t last_sleep_duration_s
         uint32_t uptime_seconds
         uint32_t free_heap_bytes
+        uint8_t  pump_dry
     """
 
-    FMT = "<IffBHIBIfBBBBIHHIffIQIIII"
+    FMT = "<IffBHIBIfBBBBIHHIffIQIIIIB"
+    # Ältere Firmware sendet 80 Bytes ohne pump_dry am Ende
+    LEGACY_FMT = FMT[:-1]
 
     @staticmethod
     def parse(data: bytearray):
         try:
             expected_size = struct.calcsize(MeasurementParser.FMT)
+            if len(data) == struct.calcsize(MeasurementParser.LEGACY_FMT):
+                data = bytes(data) + b"\x00"
             if len(data) != expected_size:
                 logger.error(
                     f"Payload-Größe stimmt nicht! Erwartet {expected_size} Bytes, "
@@ -67,6 +72,7 @@ class MeasurementParser:
                 # Bewässerung
                 "irrigated": bool(u[6]),
                 "irrigation_ms": u[7],
+                "pump_dry": bool(u[25]),
 
                 # Status
                 "vbat": round(u[8], 3),

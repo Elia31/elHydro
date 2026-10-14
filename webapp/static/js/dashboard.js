@@ -149,8 +149,10 @@ const Dashboard = {
             // UTC zu lokaler Zeit über Browser-Timezone
             utc -= now.getTimezoneOffset() / 60;
             utc = ((utc % 24) + 24) % 24;
-            const h = Math.floor(utc);
-            const m = Math.round((utc - h) * 60);
+            // Erst auf ganze Minuten runden, sonst kann "6:60" entstehen
+            const totalMin = Math.round(utc * 60) % (24 * 60);
+            const h = Math.floor(totalMin / 60);
+            const m = totalMin % 60;
             return `${h}:${m.toString().padStart(2, '0')}`;
         }
 
@@ -213,13 +215,11 @@ const Dashboard = {
 
     driestPlant(devices) {
         let driest = null;
-        let driestName = null;
         for (const d of devices) {
             const m = App.state.devices[d.mac];
             if (!m || typeof m.soil_pct !== 'number') continue;
             if (driest === null || m.soil_pct < driest) {
                 driest = m.soil_pct;
-                driestName = d.name || d.mac;
             }
         }
         if (driest === null) return { value: '-', label: 'Trockenste', cls: 'blue' };
@@ -257,7 +257,6 @@ const Dashboard = {
         const soilCls = typeof soil === "number" ? App.soilClass(soil, target) : "good";
         const typeIconId = dev.type === "outdoor" ? "icon-sun" : "icon-home";
 
-        const statusInfo = this.statusDot(lastSeen);
         const delay = Math.min(index * 0.08, 0.4);
         const animStyle = animate ? `animation-delay:${delay}s` : "animation:none";
 
@@ -274,18 +273,22 @@ const Dashboard = {
         const delta = dev.config?.irrigation_start_delta ?? 10;
         const soilStatus = this.soilStatusText(soil, target, delta);
 
-        // Warning line (Priorität: Batterie → Offline >3d → kritisch trocken → Frost/Hitze → Überwässert → Sensor → Offline >1d)
+        // Warning line (Priorität: noch nie verbunden → Batterie → Offline >3d → Tank leer → kritisch trocken → Frost/Hitze → Überwässert → Sensor → Offline >1d)
         const now = Math.floor(Date.now() / 1000);
         const ageSec = lastSeen ? (now - lastSeen) : Infinity;
         const isOutdoor = dev.type === "outdoor";
 
         let warningHtml = '';
-        if (vbat > 0 && vbat < 3.3) {
+        if (!lastSeen) {
+            warningHtml = `<div class="card-warning warning-text"><svg width="12" height="12"><use href="#icon-info"/></svg> Noch keine Verbindung zum Sensorknoten</div>`;
+        } else if (vbat > 0 && vbat < 3.3) {
             const bPct = App.batteryPercent(vbat);
             warningHtml = `<div class="card-warning danger-text"><svg width="12" height="12"><use href="#icon-battery"/></svg> Batterie fast leer (${bPct}%)</div>`;
         } else if (ageSec > 3 * 86400) {
             const days = Math.floor(ageSec / 86400);
             warningHtml = `<div class="card-warning danger-text"><svg width="12" height="12"><use href="#icon-alert-triangle"/></svg> Seit ${days} Tagen offline<br>Bitte Gerät überprüfen</div>`;
+        } else if (dev.pump_dry) {
+            warningHtml = `<div class="card-warning danger-text"><svg width="12" height="12"><use href="#icon-droplet"/></svg> Pumpe fördert kein Wasser - Tank prüfen</div>`;
         } else if (App.criticalSoil(lastMeasurement, target, delta)) {
             const text = lastMeasurement.irrigated
                 ? "Bewässert, aber Boden bleibt trocken - Tank prüfen"
@@ -405,25 +408,7 @@ const Dashboard = {
         });
     },
 
-    statusDot(lastSeen) {
-        if (!lastSeen || lastSeen === 0) {
-            return { cls: "status-never", label: "Verbinde\u2026" };
-        }
-        const ageSec = Math.floor(Date.now() / 1000) - lastSeen;
-        if (ageSec < 300) {
-            return { cls: "status-recent", label: "Gerade aktiv" };
-        } else if (ageSec < 3600) {
-            return { cls: "status-recent", label: `vor ${Math.floor(ageSec / 60)} Min.` };
-        } else if (ageSec < 14400) {
-            return { cls: "status-idle", label: `vor ${Math.floor(ageSec / 3600)} Std.` };
-        } else {
-            return { cls: "status-stale", label: App.timeAgo(lastSeen) };
-        }
-    },
-
     esc(str) {
-        const d = document.createElement("div");
-        d.textContent = str;
-        return d.innerHTML;
+        return App.esc(str);
     },
 };

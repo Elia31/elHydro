@@ -73,8 +73,8 @@ void epd_bw_fill(epd_bw_t* epd, uint8_t color);
 // Setzt ein Pixel im Framebuffer (logische Koordinaten)
 void epd_bw_draw_pixel(epd_bw_t* epd, int x, int y, uint8_t color);
 
-// Überträgt den kompletten Framebuffer zum Display
-void epd_bw_update(epd_bw_t* epd);
+// Überträgt den kompletten Framebuffer zum Display (ESP_ERR_TIMEOUT wenn das Display nicht reagiert)
+esp_err_t epd_bw_update(epd_bw_t* epd);
 
 // Partielles Update eines Bereichs (schneller, aber mit Ghosting)
 void epd_bw_update_window(epd_bw_t* epd, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
