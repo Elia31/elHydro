@@ -2,10 +2,11 @@
 # FastAPI-Hauptanwendung: bindet alle Router ein und startet den BLE-Worker.
 import asyncio
 import logging
+import os
 import uvicorn
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
@@ -43,7 +44,7 @@ async def lifespan(app: FastAPI):
             log_store.append(data.get("message", ""), level="WARNING", mac=data.get("mac"))
         elif event == "data_received":
             mac = data.get("mac", "")
-            log_store.append(f"Messdaten empfangen", level="INFO", mac=mac)
+            log_store.append("Messdaten empfangen", level="INFO", mac=mac)
         elif event == "brain_decision":
             mac = data.get("mac", "")
             log_store.append(
@@ -54,7 +55,7 @@ async def lifespan(app: FastAPI):
     worker = BleWorker(data_manager, brain, broadcast_with_logging)
     app.state.ble_worker = worker
     task = asyncio.create_task(worker.run())
-    logging.info("elHydro Web gestartet - http://0.0.0.0:8000")
+    logging.info("elHydro Web gestartet")
     yield
     # Shutdown
     worker.running = False
@@ -74,18 +75,25 @@ app.include_router(routes_measurements.router, prefix="/api")
 app.include_router(routes_logs.router, prefix="/api")
 app.include_router(ws_router)
 
-# Statische Dateien (Frontend)
-app.mount("/static", StaticFiles(directory="static"), name="static-files")
+# Statische Dateien (Frontend), unabhängig vom Arbeitsverzeichnis
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static-files")
 
 
 # SPA Catch-All: unbekannte Pfade liefern index.html
 @app.get("/{path:path}")
 async def spa_fallback(request: Request, path: str):
-    import os
-    static_file = os.path.join("static", path)
-    if os.path.isfile(static_file):
+    # Unbekannte API-Pfade sind Fehler, keine Seiten des Dashboards
+    if path == "api" or path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="Unbekannter API-Pfad")
+    # Nur Dateien innerhalb von static/ ausliefern (kein "../" oder absoluter Pfad).
+    # Erst rein textuell prüfen, dann aufs Dateisystem zugreifen: Unter Windows
+    # baut schon das Auflösen eines UNC-Pfads (\\server\share) eine SMB-Verbindung
+    # zu diesem Server auf und meldet sich dort mit dem Windows-Konto an.
+    static_file = os.path.normpath(os.path.join(STATIC_DIR, path))
+    if static_file.startswith(STATIC_DIR + os.sep) and os.path.isfile(static_file):
         return FileResponse(static_file)
-    return FileResponse("static/index.html")
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 if __name__ == "__main__":
     import argparse

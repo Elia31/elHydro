@@ -53,6 +53,10 @@ typedef struct __attribute__((packed))
     uint32_t last_sleep_duration_s;
     uint32_t uptime_seconds;
     uint32_t free_heap_bytes;
+
+    // Gegossen, aber die Bodenfeuchte ist nicht gestiegen (Tank leer?). Steht am Ende,
+    // damit ältere 80-Byte-Einträge im NVS-Puffer weiterhin gelesen werden können.
+    uint8_t pump_dry;
 } measurement_t;
 
 #endif // MEASUREMENT_TYPES_H

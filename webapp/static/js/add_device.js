@@ -16,7 +16,7 @@ const AddDevice = {
         }
 
         const presetOptions = this.presets
-            .map(p => `<option value="${this.esc(p.name)}">${this.esc(p.name)}</option>`)
+            .map(p => `<option value="${this.esc(p.id)}">${this.esc(p.name)}</option>`)
             .join("");
 
         el.innerHTML = `
@@ -81,7 +81,7 @@ const AddDevice = {
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Pflanzentyp</label>
-                                <select class="form-select" id="add-plant-type">
+                                <select class="form-select" id="add-preset">
                                     ${presetOptions}
                                 </select>
                             </div>
@@ -185,7 +185,7 @@ const AddDevice = {
 
         const mac = document.getElementById("add-mac").value;
         const name = document.getElementById("add-name").value.trim();
-        const plantType = document.getElementById("add-plant-type").value;
+        const presetId = document.getElementById("add-preset").value;
         const locationType = document.getElementById("add-type-value").value;
         const isOutdoor = locationType === "outdoor";
         const loc = isOutdoor ? document.getElementById("add-location").value.trim() : null;
@@ -207,7 +207,7 @@ const AddDevice = {
         try {
             await App.api("/devices", {
                 method: "POST",
-                body: JSON.stringify({ mac, name, plant_type: plantType, is_outdoor: isOutdoor, location: loc }),
+                body: JSON.stringify({ mac, name, preset_id: presetId, is_outdoor: isOutdoor, location: loc }),
             });
             App.showToast(`${name} erfolgreich registriert!`, "success");
             App.navigate("/");
@@ -217,8 +217,6 @@ const AddDevice = {
     },
 
     esc(str) {
-        const d = document.createElement("div");
-        d.textContent = str || "";
-        return d.innerHTML;
+        return App.esc(str);
     },
 };

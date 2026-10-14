@@ -62,7 +62,7 @@ const PresetEditor = {
         return this.presets.map((p, i) => `
             <tr data-idx="${i}">
                 <td><input class="form-input" value="${this.esc(p.name)}" data-field="name" style="min-width:100px"></td>
-                <td><input class="form-input" type="number" value="${p.target_soil_pct}" data-field="target_soil_pct" min="0" max="100" style="width:60px"></td>
+                <td><input class="form-input" type="number" value="${p.target_soil_pct}" data-field="target_soil_pct" min="10" max="90" style="width:60px"></td>
                 <td><input class="form-input" type="number" value="${p.irrigation_start_delta ?? 10}" data-field="irrigation_start_delta" min="5" max="50" step="1" style="width:60px"></td>
                 <td><input class="form-input" type="number" value="${p.sleep_multiplier}" data-field="sleep_multiplier" min="0.1" max="5" step="0.05" style="width:60px"></td>
                 <td>
@@ -135,8 +135,6 @@ const PresetEditor = {
     },
 
     esc(str) {
-        const d = document.createElement("div");
-        d.textContent = str || "";
-        return d.innerHTML;
+        return App.esc(str);
     },
 };

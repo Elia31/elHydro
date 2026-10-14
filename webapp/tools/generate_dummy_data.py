@@ -6,7 +6,8 @@ Bewässerungsentscheidungen. Simuliert LiPo-Entladung, variable Messintervalle,
 Offline-Phasen und ESP32-System-Statistiken.
 
 Nutzung:
-    CLI:  python generate_dummy_data.py --name "Ficus" --target 45 --entries 200
+    CLI:  python tools/generate_dummy_data.py --name "Ficus" --target 45 --entries 200
+          (im Ordner webapp/, bei gestopptem Server)
     GUI:  Wird vom Launcher-Tab "Testdaten" aufgerufen
 """
 
@@ -15,41 +16,24 @@ import asyncio
 import csv
 import json
 import math
-import os
 import random
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # Projektwurzel (Parent von tools/) zum Import-Pfad hinzufügen
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.core.brain import Brain, BrainDecision, _evap_delta
+from src.core.brain import Brain, BrainDecision, _evap_delta, irrigation_threshold, soil_threshold
+from src.core.data_manager import CSV_FIELDS, csv_filename
 from src.core.weather import get_weather_for_device
+from src.utils.constants import DATA_DIR, write_json_atomic
 
 # --- Konstanten ---
 
-SCRIPT_DIR = Path(__file__).parent
-DEFAULT_DATA_DIR = SCRIPT_DIR / "data"
-
-CSV_HEADER = [
-    "timestamp", "measurement_id", "online", "soil_pct", "soil_raw",
-    "temp", "rh", "vbat", "target_soil_pct", "irrigation_start_delta",
-    "offline_sleep_s", "calib_dry", "calib_wet",
-    "irrigated", "irrigation_ms", "total_irrigation_ms",
-    "total_wakeups", "avg_awake_s", "ble_success_pct",
-    "total_awake_ms", "last_awake_time_ms",
-    "last_sleep_duration_s", "uptime_seconds", "free_heap_bytes",
-    "reset_reason",
-    "brain_sleep_s", "brain_irrigate", "brain_reasoning",
-]
-
-# LiPo-Entladekurve (portiert aus app.js:313-316)
-LIPO_TABLE = [
-    (4.20, 100), (4.10, 92), (4.00, 83), (3.90, 72), (3.80, 59),
-    (3.70, 45), (3.60, 30), (3.50, 17), (3.40, 8), (3.30, 3), (3.00, 0),
-]
+# Gleicher Datenordner wie der Server
+DEFAULT_DATA_DIR = Path(DATA_DIR)
 
 
 # ESP32 Reset Reasons
@@ -150,18 +134,18 @@ def _lipo_voltage_drop(irrigated: bool) -> float:
 
 # --- Hauptgenerierung ---
 
-def generate_device_data(config: dict) -> str:
+def generate_device_data(config: dict) -> tuple[str, int]:
     """
     Generiert realistische Messdaten für ein Gerät.
 
     Args:
         config: dict mit Schlüsseln:
-            name, mac, target_soil_pct, num_entries, temp_min, temp_max,
-            location_type ("indoor"/"outdoor"), irrigation_frequency,
-            data_dir (optional)
+            name, mac, target_soil_pct, irrigation_start_delta, offline_sleep_s,
+            plant_multiplier, preset_id, num_entries,
+            location_type ("indoor"/"outdoor"), location, data_dir (optional)
 
     Returns:
-        Pfad zur erstellten CSV-Datei
+        (Pfad zur erstellten CSV-Datei, Anzahl der Messungen)
     """
     name = config.get("name", "Testpflanze")
     mac = config.get("mac", "AA:BB:CC:DD:EE:FF")
@@ -311,11 +295,13 @@ def generate_device_data(config: dict) -> str:
             # ESP32 offline: kein BLE → kein Brain vom Server.
             # Nutzt adaptive Sleep-Dauer (Soil-Margin + Evaporation) und
             # eigene simple Bewässerungslogik.
-            offline_threshold = max(target - delta, max(int(target * 0.2), 5))
             offline_sleep = _calc_offline_sleep_s(
                 device_config["offline_sleep_s"], int(soil),
-                offline_threshold, temp, rh)
-            offline_irrigate = int(soil) < offline_threshold
+                soil_threshold(target, delta), temp, rh)
+            # Wie in der Firmware: Gieß-Schwelle um den Verdunstungs-Index
+            # anheben, bei Frost (<= 0 °C) gar nicht gießen
+            irr_threshold = irrigation_threshold(target, delta, _evap_delta(temp, rh))
+            offline_irrigate = int(soil) < irr_threshold and temp > 0
 
             if offline_irrigate:
                 deficit = max(0, target - soil)
@@ -328,7 +314,7 @@ def generate_device_data(config: dict) -> str:
 
             reasoning = f"Offline (kein BLE); Sleep {offline_sleep}s (adaptiv)"
             if irrigated:
-                reasoning += f"; Offline-Bewässerung ({int(soil - soil_boost):.0f}% < {offline_threshold}%)"
+                reasoning += f"; Offline-Bewässerung ({int(soil - soil_boost):.0f}% < {irr_threshold}%)"
 
             decision = BrainDecision(
                 sleep_duration_s=offline_sleep,
@@ -338,20 +324,29 @@ def generate_device_data(config: dict) -> str:
         else:
             # Online: Server-Brain entscheidet
             recent_history = rows[-10:] if rows else []
-            is_last_iteration = entries_generated == num_entries - 1
-            decision = brain.decide(
-                device_config=device_config,
-                plant_multiplier=plant_multiplier,
-                is_outdoor=is_outdoor,
-                current_soil=int(soil),
-                current_temp=temp,
-                current_rh=rh,
-                weather_data=last_weather if is_last_iteration else None,
-                last_irrigated_ts=last_irrigated_ts,
-                previous_soil=previous_soil,
-                history=recent_history,
-                now_ts=int(current_ts),
-            )
+
+            def _decide(weather):
+                return brain.decide(
+                    device_config=device_config,
+                    plant_multiplier=plant_multiplier,
+                    is_outdoor=is_outdoor,
+                    current_soil=int(soil),
+                    current_temp=temp,
+                    current_rh=rh,
+                    weather_data=weather,
+                    last_irrigated_ts=last_irrigated_ts,
+                    previous_soil=previous_soil,
+                    history=recent_history,
+                    now_ts=int(current_ts),
+                )
+
+            decision = _decide(None)
+            # Das Wetter gilt für jetzt: in die Entscheidung der letzten Messung
+            # einrechnen (gewünschte Anzahl erreicht oder nächster Zeitpunkt nach jetzt,
+            # +60 s für den Jitter unten)
+            if last_weather and (entries_generated == num_entries - 1
+                                 or current_ts + decision.sleep_duration_s + 60 > now):
+                decision = _decide(last_weather)
 
             if decision.should_irrigate:
                 deficit = max(0, target - soil)
@@ -452,10 +447,9 @@ def generate_device_data(config: dict) -> str:
     measurements_dir = data_dir / "measurements"
     measurements_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = mac.replace(":", "_") + ".csv"
-    csv_path = measurements_dir / filename
+    csv_path = measurements_dir / csv_filename(mac)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -472,7 +466,7 @@ def generate_device_data(config: dict) -> str:
 
     settings[mac] = {
         "name": name,
-        "plant_type": config.get("plant_type", "Standard (Normal)"),
+        "preset_id": config.get("preset_id", "standard"),
         "type": "outdoor" if is_outdoor else "indoor",
         "location": config.get("location") or (None if not is_outdoor else None),
         "config": device_config,
@@ -489,9 +483,7 @@ def generate_device_data(config: dict) -> str:
             "fetched_at": int(time.time()),
         }
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    with open(settings_path, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=4, ensure_ascii=False)
+    write_json_atomic(str(settings_path), settings)
 
     return str(csv_path), len(rows)
 
@@ -509,7 +501,8 @@ def main():
     parser.add_argument("--entries", type=int, default=200, help="Anzahl Einträge")
     parser.add_argument("--outdoor", action="store_true", help="Außenpflanze")
     parser.add_argument("--location", default=None, help="Ort/Koordinaten (nur für --outdoor, z.B. 'Berlin' oder '52.52,13.41')")
-    parser.add_argument("--data-dir", default=None, help="Datenverzeichnis")
+    parser.add_argument("--data-dir", default=None,
+                        help=f"Datenverzeichnis (Standard: {DEFAULT_DATA_DIR}, wie bei python main.py)")
     args = parser.parse_args()
 
     if args.mac is None:
@@ -533,8 +526,13 @@ def main():
     print(f"Generiere Daten für '{args.name}' ({args.mac})...")
     pfad, anzahl = generate_device_data(config)
     print(f"  -> {anzahl} Messwerte in {pfad}")
-    print(f"\nFertig! Starte den Server mit:")
-    print(f"  cd elHydro_web && python -m uvicorn main:app --host 0.0.0.0 --port 8080")
+    # Ein laufender Server kennt das neue Gerät nicht und überschreibt
+    # device_settings.json beim nächsten Speichern mit seinem alten Stand
+    print("\nFertig! Server jetzt (neu) starten, damit er die Testdaten lädt (im Ordner webapp/):")
+    if args.data_dir:
+        print(f"  ELHYDRO_DATA_DIR={args.data_dir} python main.py")
+    else:
+        print("  python main.py")
 
 
 if __name__ == "__main__":

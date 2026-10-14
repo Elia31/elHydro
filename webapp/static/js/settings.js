@@ -20,9 +20,14 @@ const Settings = {
             const name = device.name || mac;
             const isOutdoor = device.type === "outdoor";
 
-            const presetOptions = presets.map(p =>
-                `<option value="${this.esc(p.name)}" ${device.plant_type === p.name ? 'selected' : ''}>${this.esc(p.name)}</option>`
+            let presetOptions = presets.map(p =>
+                `<option value="${this.esc(p.id)}" ${device.preset_id === p.id ? 'selected' : ''}>${this.esc(p.name)}</option>`
             ).join("");
+            // Gelöschtes Preset trotzdem anzeigen, sonst würde beim Speichern
+            // still das erste Preset übernommen
+            if (!presets.some(p => p.id === device.preset_id)) {
+                presetOptions = `<option value="${this.esc(device.preset_id || '')}" selected>Gelöschtes Preset</option>` + presetOptions;
+            }
 
             el.innerHTML = `
                 <div class="page-enter">
@@ -46,7 +51,7 @@ const Settings = {
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Pflanzentyp</label>
-                                <select class="form-select" id="set-plant-type" onchange="Settings.onPresetChange()">
+                                <select class="form-select" id="set-preset" onchange="Settings.onPresetChange()">
                                     ${presetOptions}
                                 </select>
                             </div>
@@ -75,10 +80,10 @@ const Settings = {
                             <div class="form-hint" style="margin-bottom:0.75rem">Schlafzeit wenn der ESP32 keine Serververbindung hat</div>
                             <div class="form-group">
                                 <label class="form-label">Offline Sleep: <strong id="offline-sleep-label">${App.formatDuration((config.offline_sleep_s ?? 14400))}</strong></label>
-                                <input class="form-input" type="number" id="set-offline-sleep" min="10"
+                                <input class="form-input" type="number" id="set-offline-sleep" min="10" max="1440"
                                        value="${Math.round((config.offline_sleep_s ?? 14400) / 60)}"
                                        oninput="Settings.updateSleepLabel('set-offline-sleep','offline-sleep-label')">
-                                <div class="form-hint">Sleep-Dauer in Minuten</div>
+                                <div class="form-hint">Sleep-Dauer in Minuten (10 bis 1440)</div>
                             </div>
                         </div>
 
@@ -135,8 +140,8 @@ const Settings = {
     },
 
     onPresetChange() {
-        const selected = document.getElementById("set-plant-type").value;
-        const preset = this.presets.find(p => p.name === selected);
+        const selected = document.getElementById("set-preset").value;
+        const preset = this.presets.find(p => p.id === selected);
         if (preset && preset.id !== "custom") {
             document.getElementById("set-target").value = preset.target_soil_pct;
             if (preset.irrigation_start_delta != null) {
@@ -205,7 +210,7 @@ const Settings = {
             target_soil_pct: parseInt(document.getElementById("set-target").value),
             irrigation_start_delta: parseInt(document.getElementById("set-irr-delta").value),
             offline_sleep_s: parseInt(document.getElementById("set-offline-sleep").value) * 60,
-            plant_type: document.getElementById("set-plant-type").value,
+            preset_id: document.getElementById("set-preset").value || null,
             type: locationType,
             location: locationValue,
         };
@@ -223,8 +228,6 @@ const Settings = {
     },
 
     esc(str) {
-        const d = document.createElement("div");
-        d.textContent = str || "";
-        return d.innerHTML;
+        return App.esc(str);
     },
 };

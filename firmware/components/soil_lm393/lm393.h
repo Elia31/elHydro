@@ -1,6 +1,6 @@
 /**
  * @file lm393.h
- * @brief Treiber für LM393 Bodenfeuchtesensor (kapazitiv)
+ * @brief Treiber für LM393 Bodenfeuchtesensor (resistiv)
  */
 
 #ifndef LM393_H

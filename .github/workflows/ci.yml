@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  webapp:
+    name: Host-Anwendung (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Älteste unterstützte und aktuelle Version
+        python-version: ["3.10", "3.13"]
+    defaults:
+      run:
+        working-directory: webapp
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: webapp/requirements*.txt
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tests (pytest)
+        run: pytest
+
+  firmware:
+    name: Firmware (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Alle Display-Varianten mit dem kapazitiven Sensor, dazu einmal der LM393
+        include:
+          - variant: Schwarz/Weiß
+            display: USE_BW_DISPLAY
+            sensor: USE_CAPACITIVE_V2_SENSOR
+          - variant: Schwarz/Weiß/Rot
+            display: USE_BWR_DISPLAY
+            sensor: USE_CAPACITIVE_V2_SENSOR
+          - variant: Vier Farben
+            display: USE_4COLOR_DISPLAY
+            sensor: USE_CAPACITIVE_V2_SENSOR
+          - variant: LM393-Sensor
+            display: USE_BW_DISPLAY
+            sensor: USE_LM393_SENSOR
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Variante in config.h einstellen
+        working-directory: firmware
+        run: |
+          sed -i -E 's/^(#define USE_[A-Z0-9_]+_(DISPLAY|SENSOR)\s+)1$/\10/' main/config.h
+          sed -i -E 's/^(#define (${{ matrix.display }}|${{ matrix.sensor }})\s+)0$/\11/' main/config.h
+          grep -E '^#define USE_[A-Z0-9_]+_(DISPLAY|SENSOR)\s' main/config.h
+
+      - name: Bauen (ESP-IDF 5.5)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5
+          target: esp32c6
+          path: firmware
+
+  firmware-format:
+    name: Firmware-Formatierung (clang-format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: clang-format prüfen
+        working-directory: firmware
+        run: pipx run --spec clang-format==21.1.8 clang-format --dry-run --Werror main/*.[ch] components/*/*.[ch]

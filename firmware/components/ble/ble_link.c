@@ -50,6 +50,11 @@ static const ble_uuid128_t UUID_CHR_IRRIGATION =
 static const ble_uuid128_t UUID_CHR_IRR_DELTA =
     BLE_UUID128_INIT(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x40, 0x08, 0x40, 0x6E);
 
+// Messdaten als Indication: Der Host bestätigt jede Messung, erst dann gilt sie als
+// übertragen. Ältere Hosts abonnieren weiter UUID_CHR_MEASUREMENT (Notify).
+static const ble_uuid128_t UUID_CHR_MEASUREMENT_IND =
+    BLE_UUID128_INIT(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x40, 0x06, 0x40, 0x6E);
+
 // ============================================================================
 // Verbindungsparameter
 // ============================================================================
@@ -61,6 +66,13 @@ static const struct ble_gap_upd_params CONNECTION_PARAMS = {
     .supervision_timeout = 1000, // Timeout: 10 s
 };
 
+// So lange wird auf die Bestätigung einer Indication gewartet
+#define INDICATE_TIMEOUT_MS 5000
+
+// Pause nach jeder Notification, damit die Sendepuffer beim Nachsenden vieler
+// gepufferter Messungen nicht überlaufen (Indications warten auf die Bestätigung)
+#define NOTIFY_PACING_MS 50
+
 // ============================================================================
 // Interner Zustand
 // ============================================================================
@@ -68,17 +80,24 @@ static const struct ble_gap_upd_params CONNECTION_PARAMS = {
 static bool s_initialized = false;
 
 // Verbindung
-static uint16_t s_conn_handle    = BLE_HS_CONN_HANDLE_NONE;
-static bool     s_notify_enabled = false;
+static uint16_t s_conn_handle      = BLE_HS_CONN_HANDLE_NONE;
+static bool     s_notify_enabled   = false; // Notify-Charakteristik abonniert (ältere Hosts)
+static bool     s_indicate_enabled = false; // Indication-Charakteristik abonniert
+
+// Laufende Indication: Das Ergebnis meldet der GAP-Event-Handler (NimBLE erlaubt
+// pro Verbindung nur eine unbestätigte Indication)
+static volatile bool      s_indicate_pending = false;
+static volatile esp_err_t s_indicate_result  = ESP_FAIL;
 
 // GATT Handles
-static uint16_t s_handle_measurement   = 0;
-static uint16_t s_handle_target_soil   = 0;
-static uint16_t s_handle_sleep         = 0;
-static uint16_t s_handle_offline_sleep = 0;
-static uint16_t s_handle_time          = 0;
-static uint16_t s_handle_irrigation    = 0;
-static uint16_t s_handle_irr_delta     = 0;
+static uint16_t s_handle_measurement     = 0;
+static uint16_t s_handle_measurement_ind = 0;
+static uint16_t s_handle_target_soil     = 0;
+static uint16_t s_handle_sleep           = 0;
+static uint16_t s_handle_offline_sleep   = 0;
+static uint16_t s_handle_time            = 0;
+static uint16_t s_handle_irrigation      = 0;
+static uint16_t s_handle_irr_delta       = 0;
 
 // Empfangene Steuerbefehle
 static ble_link_control_t s_control = { 0 };
@@ -92,6 +111,7 @@ static volatile bool s_auto_restart_adv = true;
 static SemaphoreHandle_t s_mutex        = NULL;
 static SemaphoreHandle_t s_notify_mutex = NULL;
 static SemaphoreHandle_t s_control_sem  = NULL;
+static SemaphoreHandle_t s_indicate_sem = NULL;
 
 // ============================================================================
 // Vorwärtsdeklarationen
@@ -106,19 +126,32 @@ static int  gatt_access_handler(uint16_t conn_handle, uint16_t attr_handle, stru
 // Thread-sichere Hilfsfunktionen
 // ============================================================================
 
-static void set_notify_enabled(bool enabled)
+// Für s_notify_enabled und s_indicate_enabled
+static void set_subscribed(bool* flag, bool enabled)
 {
     xSemaphoreTake(s_notify_mutex, portMAX_DELAY);
-    s_notify_enabled = enabled;
+    *flag = enabled;
     xSemaphoreGive(s_notify_mutex);
 }
 
-static bool get_notify_enabled(void)
+static bool get_subscribed(const bool* flag)
 {
     xSemaphoreTake(s_notify_mutex, portMAX_DELAY);
-    bool enabled = s_notify_enabled;
+    bool enabled = *flag;
     xSemaphoreGive(s_notify_mutex);
     return enabled;
+}
+
+// Beendet die laufende Indication mit dem Ergebnis und weckt den wartenden Task
+static void indicate_finish(esp_err_t result)
+{
+    if (!s_indicate_pending)
+    {
+        return;
+    }
+    s_indicate_result  = result;
+    s_indicate_pending = false;
+    xSemaphoreGive(s_indicate_sem);
 }
 
 // Setzt einen Kontrollwert und signalisiert dass neue Daten vorliegen
@@ -301,6 +334,13 @@ static const struct ble_gatt_svc_def GATT_SERVICES[] = {
                 .flags      = BLE_GATT_CHR_F_WRITE,
                 .val_handle = &s_handle_irr_delta,
             },
+            // Am Ende, damit sich die Handles der übrigen Charakteristiken nicht ändern
+            {
+                .uuid       = &UUID_CHR_MEASUREMENT_IND.u,
+                .access_cb  = gatt_access_handler,
+                .flags      = BLE_GATT_CHR_F_INDICATE,
+                .val_handle = &s_handle_measurement_ind,
+            },
             { 0 }
         },
     },
@@ -339,7 +379,9 @@ static int gap_event_handler(struct ble_gap_event* event, void* arg)
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "Getrennt (reason=%d)", event->disconnect.reason);
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            set_notify_enabled(false);
+            set_subscribed(&s_notify_enabled, false);
+            set_subscribed(&s_indicate_enabled, false);
+            indicate_finish(ESP_ERR_INVALID_STATE);
             if (s_auto_restart_adv)
             {
                 ble_link_start_advertising();
@@ -350,8 +392,23 @@ static int gap_event_handler(struct ble_gap_event* event, void* arg)
             if (event->subscribe.attr_handle == s_handle_measurement)
             {
                 bool enabled = (event->subscribe.cur_notify != 0);
-                set_notify_enabled(enabled);
+                set_subscribed(&s_notify_enabled, enabled);
                 ESP_LOGI(TAG, "Notifications %s", enabled ? "aktiviert" : "deaktiviert");
+            }
+            else if (event->subscribe.attr_handle == s_handle_measurement_ind)
+            {
+                bool enabled = (event->subscribe.cur_indicate != 0);
+                set_subscribed(&s_indicate_enabled, enabled);
+                ESP_LOGI(TAG, "Indications %s", enabled ? "aktiviert" : "deaktiviert");
+            }
+            break;
+
+        case BLE_GAP_EVENT_NOTIFY_TX:
+            // Status 0 heißt nur "gesendet". Erst BLE_HS_EDONE ist die Bestätigung des
+            // Hosts, jeder andere Status ein Fehler (z.B. Timeout oder Verbindungsabbruch).
+            if (event->notify_tx.indication && event->notify_tx.attr_handle == s_handle_measurement_ind && event->notify_tx.status != 0)
+            {
+                indicate_finish(event->notify_tx.status == BLE_HS_EDONE ? ESP_OK : ESP_FAIL);
             }
             break;
 
@@ -468,6 +525,7 @@ esp_err_t ble_link_init(const char* device_name)
     s_mutex        = xSemaphoreCreateMutex();
     s_notify_mutex = xSemaphoreCreateMutex();
     s_control_sem  = xSemaphoreCreateBinary();
+    s_indicate_sem = xSemaphoreCreateBinary();
 
     // MTU auf Maximum für BLE 4.2 setzen
     ble_att_set_preferred_mtu(247);
@@ -487,7 +545,7 @@ esp_err_t ble_link_init(const char* device_name)
 
 esp_err_t ble_link_start_advertising(void)
 {
-    // Wieder freigeben fuer Auto-Restarts (falls vorher per ble_link_stop deaktiviert)
+    // Wieder freigeben für Auto-Restarts (falls vorher per ble_link_stop deaktiviert)
     s_auto_restart_adv = true;
 
     if (ble_gap_adv_active())
@@ -589,14 +647,14 @@ bool ble_link_is_connected(void)
 
 bool ble_link_client_ready(void)
 {
-    return ble_link_is_connected() && get_notify_enabled();
+    return ble_link_is_connected() && (get_subscribed(&s_notify_enabled) || get_subscribed(&s_indicate_enabled));
 }
 
 // ============================================================================
 // Öffentliche API - Datenübertragung
 // ============================================================================
 
-esp_err_t ble_link_notify_measurement(const measurement_t* measurement)
+esp_err_t ble_link_send_measurement(const measurement_t* measurement)
 {
     if (!measurement)
     {
@@ -608,7 +666,15 @@ esp_err_t ble_link_notify_measurement(const measurement_t* measurement)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Direkt als Flat-Buffer in den mbuf kopieren und Notification senden
+    bool use_indicate = get_subscribed(&s_indicate_enabled);
+    if (use_indicate && s_indicate_pending)
+    {
+        // Die vorherige Indication ist noch unbestätigt (Timeout)
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Direkt als Flat-Buffer in den mbuf kopieren. NimBLE gibt ihn beim Senden
+    // in jedem Fall selbst frei, auch bei einem Fehler.
     struct os_mbuf* om = ble_hs_mbuf_from_flat(measurement, sizeof(*measurement));
     if (!om)
     {
@@ -616,15 +682,44 @@ esp_err_t ble_link_notify_measurement(const measurement_t* measurement)
         return ESP_ERR_NO_MEM;
     }
 
-    int rc = ble_gatts_notify_custom(s_conn_handle, s_handle_measurement, om);
+    if (!use_indicate)
+    {
+        // Ältere Hosts: Notification ohne Empfangsbestätigung
+        int rc = ble_gatts_notify_custom(s_conn_handle, s_handle_measurement, om);
+        if (rc != 0)
+        {
+            ESP_LOGW(TAG, "Notification fehlgeschlagen (rc=%d)", rc);
+            return ESP_FAIL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(NOTIFY_PACING_MS));
+        ESP_LOGI(TAG, "Messung #%lu gesendet", (unsigned long) measurement->measurement_id);
+        return ESP_OK;
+    }
+
+    // Ein Ergebnis von einer früheren, abgebrochenen Indication verwerfen
+    xSemaphoreTake(s_indicate_sem, 0);
+    s_indicate_pending = true;
+
+    int rc = ble_gatts_indicate_custom(s_conn_handle, s_handle_measurement_ind, om);
     if (rc != 0)
     {
-        ESP_LOGW(TAG, "Notification fehlgeschlagen (rc=%d)", rc);
-        os_mbuf_free_chain(om);
+        s_indicate_pending = false;
+        ESP_LOGW(TAG, "Indication fehlgeschlagen (rc=%d)", rc);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Messung #%lu gesendet", (unsigned long) measurement->measurement_id);
+    if (xSemaphoreTake(s_indicate_sem, pdMS_TO_TICKS(INDICATE_TIMEOUT_MS)) != pdTRUE)
+    {
+        ESP_LOGW(TAG, "Messung #%lu: keine Bestätigung vom Host", (unsigned long) measurement->measurement_id);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_indicate_result != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Messung #%lu: nicht bestätigt", (unsigned long) measurement->measurement_id);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Messung #%lu gesendet und bestätigt", (unsigned long) measurement->measurement_id);
     return ESP_OK;
 }
 
@@ -673,6 +768,11 @@ bool ble_link_wait_for_control(uint32_t timeout_ms, ble_link_control_t* out_ctrl
             ESP_LOGE(TAG, "Mutex timeout in wait_for_control (result copy)");
             return false;
         }
+        // Auch Befehle zählen, die vor einem Verbindungsabbruch angekommen sind
+        // (die Schleife oben bricht dann sofort ab, ohne die Semaphore zu nehmen)
+        received_any = s_control.have_target_soil || s_control.have_irrigation_start_delta || s_control.have_sleep_s
+                       || s_control.have_offline_sleep || s_control.have_unix_time || s_control.have_irrigation_request;
+
         *out_ctrl                             = s_control;
         s_control.have_target_soil            = false;
         s_control.have_irrigation_start_delta = false;

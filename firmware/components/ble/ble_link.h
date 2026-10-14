@@ -64,15 +64,18 @@ esp_err_t ble_link_stop(void);
 // Prüft ob eine BLE-Verbindung besteht
 bool ble_link_is_connected(void);
 
-// Prüft ob Client verbunden UND Notifications aktiviert hat
+// Prüft ob Client verbunden UND Notifications oder Indications aktiviert hat
 bool ble_link_client_ready(void);
 
 // ============================================================================
 // Datenübertragung
 // ============================================================================
 
-// Sendet Messdaten als GATT-Notify (nur wenn Client verbunden und subscribed)
-esp_err_t ble_link_notify_measurement(const measurement_t* measurement);
+// Sendet eine Messung an den Host (nur wenn Client verbunden und subscribed).
+// Hat der Host die Indication-Charakteristik abonniert, kommt ESP_OK erst nach seiner
+// Bestätigung. Ältere Hosts abonnieren nur die Notify-Charakteristik, dann bedeutet
+// ESP_OK nur "gesendet".
+esp_err_t ble_link_send_measurement(const measurement_t* measurement);
 
 // ============================================================================
 // Steuerung empfangen

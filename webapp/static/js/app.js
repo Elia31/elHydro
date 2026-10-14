@@ -141,13 +141,21 @@ const App = {
     },
 
     // --- Zustands-Checks für Warnungen ---
+    // Gleiche Werte wie brain.py und config.h (der Test test_firmware_sync.py prüft das)
+    IRR_THRESHOLD_TARGET_RATIO: 0.2,
+    IRR_THRESHOLD_MIN_ABS: 5,
+
+    // Gieß-Schwelle wie Firmware und Brain: max(target - delta, 20 % vom Ziel, 5 %)
+    soilThreshold(target, delta) {
+        const targetMin = Math.max(Math.floor(target * App.IRR_THRESHOLD_TARGET_RATIO), App.IRR_THRESHOLD_MIN_ABS);
+        return Math.max(target - delta, targetMin);
+    },
+
     criticalSoil(m, target, delta) {
         if (!m || typeof m.soil_pct !== "number") return false;
         const t = target ?? m.target_soil_pct ?? 50;
         const d = delta ?? m.irrigation_start_delta ?? 10;
-        const targetMin = Math.max(Math.floor(t * 0.2), 5);
-        const threshold = Math.max(t - d, targetMin);
-        return m.soil_pct < threshold;
+        return m.soil_pct < App.soilThreshold(t, d);
     },
 
     overwatered(m, target) {
@@ -172,15 +180,19 @@ const App = {
 
     // --- Alerts ---
     checkAlerts(mac, m) {
-        // Toast nur bei frischer Bewässerung, die nichts gebracht hat
-        if (m.irrigated && typeof m.soil_pct === "number") {
-            const target = m.target_soil_pct || 50;
-            const delta = m.irrigation_start_delta || 10;
-            const threshold = Math.max(target - delta, 11);
+        // Toast nur bei frischer Bewässerung, die nichts gebracht hat. Die Messung
+        // nach dem Gießen kommt beim nächsten Kontakt als gepufferte Messung.
+        // Hat die Firmware einen Trockenlauf erkannt (pump_dry), meldet das schon der Server.
+        if (m.irrigated && !m.pump_dry && typeof m.soil_pct === "number") {
+            const threshold = App.soilThreshold(m.target_soil_pct || 50, m.irrigation_start_delta || 10);
             if (m.soil_pct < threshold - 5) {
                 App.showToast(`${mac}: Bewässert, aber Boden bleibt trocken (${m.soil_pct}%) - Wassertank prüfen`, "warning");
             }
         }
+
+        // Batterie nur bei der aktuellen Messung prüfen, sonst kommt beim
+        // Nachsenden eines Puffers für jede gepufferte Messung ein eigener Hinweis
+        if (!(m.online === true || m.online === 1)) return;
 
         // Batterie-Warnungen
         if (m.vbat > 0 && m.vbat < 3.2) {
@@ -205,7 +217,7 @@ const App = {
         const iconId = iconMap[type] || "icon-info";
 
         toast.style.setProperty('--toast-duration', (duration / 1000) + 's');
-        toast.innerHTML = `<svg><use href="#${iconId}"/></svg><span>${this.escText(message)}</span><div class="toast-progress"></div>`;
+        toast.innerHTML = `<svg><use href="#${iconId}"/></svg><span>${this.esc(message)}</span><div class="toast-progress"></div>`;
         toast.onclick = () => toast.remove();
         container.appendChild(toast);
         setTimeout(() => {
@@ -213,10 +225,12 @@ const App = {
         }, duration);
     },
 
-    escText(str) {
+    // Für Text und Attributwerte: innerHTML allein maskiert keine Anführungszeichen,
+    // ein Name wie 6" Topf würde sonst value="..." vorzeitig beenden
+    esc(str) {
         const d = document.createElement("div");
-        d.textContent = str;
-        return d.innerHTML;
+        d.textContent = str ?? "";
+        return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     },
 
     // --- Theme ---
@@ -298,7 +312,9 @@ const App = {
         });
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-            throw new Error(err.detail || "API Fehler");
+            // Validierungsfehler (422) liefern eine Liste statt eines Textes
+            const detail = Array.isArray(err.detail) ? err.detail.map(d => d.msg).join(", ") : err.detail;
+            throw new Error(detail || "API Fehler");
         }
         if (options.raw) return resp;
         return resp.json();

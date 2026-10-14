@@ -26,7 +26,8 @@ static const char* TAG = "EPD_BWR";
 #define FRAMEBUFFER_SIZE ((EPD_BWR_PHYS_WIDTH * EPD_BWR_PHYS_HEIGHT) / 8)
 
 // Timeout für BUSY-Pin
-#define BUSY_TIMEOUT_US 15000000 // 15 Sekunden (3-Farb braucht länger)
+#define BUSY_TIMEOUT_US    15000000 // 15 Sekunden für Reset, Init und Power Off
+#define REFRESH_TIMEOUT_US 30000000 // 30 Sekunden für den Refresh (laut Datenblatt 16 s, bei Kälte länger)
 
 // ============================================================================
 // SPI-Kommunikation
@@ -55,7 +56,7 @@ static esp_err_t send_data_byte(epd_bwr_t* epd, uint8_t value)
 // BUSY-Pin Handling
 // ============================================================================
 
-static void wait_busy(epd_bwr_t* epd, const char* context)
+static esp_err_t wait_busy(epd_bwr_t* epd, const char* context, int64_t timeout_us)
 {
     if (epd->debug)
     {
@@ -68,12 +69,13 @@ static void wait_busy(epd_bwr_t* epd, const char* context)
     {
         vTaskDelay(pdMS_TO_TICKS(10));
 
-        if (esp_timer_get_time() - start > BUSY_TIMEOUT_US)
+        if (esp_timer_get_time() - start > timeout_us)
         {
             ESP_LOGW(TAG, "BUSY Timeout bei: %s", context);
-            break;
+            return ESP_ERR_TIMEOUT;
         }
     }
+    return ESP_OK;
 }
 
 // ============================================================================
@@ -100,29 +102,31 @@ static void transform_coords(epd_bwr_t* epd, int x, int y, int* phys_x, int* phy
 // Reset-Funktionen
 // ============================================================================
 
-static void hardware_reset(epd_bwr_t* epd)
+static esp_err_t hardware_reset(epd_bwr_t* epd)
 {
     gpio_set_level(epd->pin_rst, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(epd->pin_rst, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
-    wait_busy(epd, "Hardware-Reset");
+    return wait_busy(epd, "Hardware-Reset", BUSY_TIMEOUT_US);
 }
 
-static void software_reset(epd_bwr_t* epd)
+static esp_err_t software_reset(epd_bwr_t* epd)
 {
     send_command(epd, 0x12);
-    wait_busy(epd, "Software-Reset");
+    return wait_busy(epd, "Software-Reset", BUSY_TIMEOUT_US);
 }
 
 // ============================================================================
 // SSD1680 Initialisierungssequenz (3-Farb-Modus)
 // ============================================================================
 
-static void init_sequence(epd_bwr_t* epd)
+static esp_err_t init_sequence(epd_bwr_t* epd)
 {
-    hardware_reset(epd);
-    software_reset(epd);
+    if (hardware_reset(epd) != ESP_OK || software_reset(epd) != ESP_OK)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
 
     // Driver Output Control (128x296)
     send_command(epd, 0x01);
@@ -168,7 +172,7 @@ static void init_sequence(epd_bwr_t* epd)
     send_data_byte(epd, 0x00);
     send_data_byte(epd, 0x00);
 
-    wait_busy(epd, "Init-Sequenz");
+    return wait_busy(epd, "Init-Sequenz", BUSY_TIMEOUT_US);
 }
 
 // ============================================================================
@@ -274,8 +278,16 @@ esp_err_t epd_bwr_init(epd_bwr_t*        epd,
     memset(epd->framebuffer_bw, 0xFF, FRAMEBUFFER_SIZE);
     memset(epd->framebuffer_red, 0xFF, FRAMEBUFFER_SIZE);
 
-    // Display initialisieren
-    init_sequence(epd);
+    // Display initialisieren (hängt BUSY, ist das Display defekt oder nicht angeschlossen)
+    ret = init_sequence(epd);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display reagiert nicht (BUSY-Timeout)");
+        epd_bwr_deinit(epd);
+        spi_bus_remove_device(epd->spi);
+        spi_bus_free(host);
+        return ret;
+    }
 
     ESP_LOGI(TAG, "Initialisierung abgeschlossen (BW+RED, 2x%d Bytes)", FRAMEBUFFER_SIZE);
     return ESP_OK;
@@ -342,9 +354,14 @@ void epd_bwr_draw_pixel(epd_bwr_t* epd, int x, int y, uint8_t color)
     }
 }
 
-void epd_bwr_update(epd_bwr_t* epd)
+esp_err_t epd_bwr_update(epd_bwr_t* epd)
 {
-    init_sequence(epd);
+    esp_err_t ret = init_sequence(epd);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display reagiert nicht, Update abgebrochen");
+        return ret;
+    }
 
     const uint16_t bytes_per_line = EPD_BWR_PHYS_WIDTH / 8;
 
@@ -367,13 +384,15 @@ void epd_bwr_update(epd_bwr_t* epd)
     send_data_byte(epd, 0xF7);
     send_command(epd, 0x20);
 
-    wait_busy(epd, "Vollständiges Update (BWR)");
+    wait_busy(epd, "Vollständiges Update (BWR)", REFRESH_TIMEOUT_US);
     epd_bwr_sleep(epd);
 
     if (epd->debug)
     {
         ESP_LOGI(TAG, "Vollständiges 3-Farb-Update abgeschlossen");
     }
+
+    return ESP_OK;
 }
 
 void epd_bwr_update_window(epd_bwr_t* epd, uint16_t x, uint16_t y, uint16_t w, uint16_t h)
@@ -475,13 +494,13 @@ void epd_bwr_update_window(epd_bwr_t* epd, uint16_t x, uint16_t y, uint16_t w, u
     send_data_byte(epd, 0xFF);
     send_command(epd, 0x20);
 
-    wait_busy(epd, "Partielles Update (BWR)");
+    wait_busy(epd, "Partielles Update (BWR)", REFRESH_TIMEOUT_US);
 }
 
 void epd_bwr_sleep(epd_bwr_t* epd)
 {
     send_command(epd, 0x02);
-    wait_busy(epd, "Power Off");
+    wait_busy(epd, "Power Off", BUSY_TIMEOUT_US);
 
     send_command(epd, 0x10);
     send_data_byte(epd, 0x01);

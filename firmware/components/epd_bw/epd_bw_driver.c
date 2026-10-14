@@ -55,7 +55,7 @@ static esp_err_t send_data_byte(epd_bw_t* epd, uint8_t value)
 // BUSY-Pin Handling
 // ============================================================================
 
-static void wait_busy(epd_bw_t* epd, const char* context)
+static esp_err_t wait_busy(epd_bw_t* epd, const char* context)
 {
     if (epd->debug)
     {
@@ -71,9 +71,10 @@ static void wait_busy(epd_bw_t* epd, const char* context)
         if (esp_timer_get_time() - start > BUSY_TIMEOUT_US)
         {
             ESP_LOGW(TAG, "BUSY Timeout bei: %s", context);
-            break;
+            return ESP_ERR_TIMEOUT;
         }
     }
+    return ESP_OK;
 }
 
 // ============================================================================
@@ -100,29 +101,31 @@ static void transform_coords(epd_bw_t* epd, int x, int y, int* phys_x, int* phys
 // Reset-Funktionen
 // ============================================================================
 
-static void hardware_reset(epd_bw_t* epd)
+static esp_err_t hardware_reset(epd_bw_t* epd)
 {
     gpio_set_level(epd->pin_rst, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(epd->pin_rst, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
-    wait_busy(epd, "Hardware-Reset");
+    return wait_busy(epd, "Hardware-Reset");
 }
 
-static void software_reset(epd_bw_t* epd)
+static esp_err_t software_reset(epd_bw_t* epd)
 {
     send_command(epd, 0x12);
-    wait_busy(epd, "Software-Reset");
+    return wait_busy(epd, "Software-Reset");
 }
 
 // ============================================================================
 // SSD1680 Initialisierungssequenz
 // ============================================================================
 
-static void init_sequence(epd_bw_t* epd)
+static esp_err_t init_sequence(epd_bw_t* epd)
 {
-    hardware_reset(epd);
-    software_reset(epd);
+    if (hardware_reset(epd) != ESP_OK || software_reset(epd) != ESP_OK)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
 
     // Driver Output Control (128x296)
     send_command(epd, 0x01);
@@ -168,7 +171,7 @@ static void init_sequence(epd_bw_t* epd)
     send_data_byte(epd, 0x00);
     send_data_byte(epd, 0x00);
 
-    wait_busy(epd, "Init-Sequenz");
+    return wait_busy(epd, "Init-Sequenz");
 }
 
 // ============================================================================
@@ -261,8 +264,16 @@ esp_err_t epd_bw_init(epd_bw_t*         epd,
 
     memset(epd->framebuffer, 0xFF, FRAMEBUFFER_SIZE);
 
-    // Display initialisieren
-    init_sequence(epd);
+    // Display initialisieren (hängt BUSY, ist das Display defekt oder nicht angeschlossen)
+    ret = init_sequence(epd);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display reagiert nicht (BUSY-Timeout)");
+        epd_bw_deinit(epd);
+        spi_bus_remove_device(epd->spi);
+        spi_bus_free(host);
+        return ret;
+    }
 
     ESP_LOGI(TAG, "Initialisierung abgeschlossen");
     return ESP_OK;
@@ -305,9 +316,14 @@ void epd_bw_draw_pixel(epd_bw_t* epd, int x, int y, uint8_t color)
     }
 }
 
-void epd_bw_update(epd_bw_t* epd)
+esp_err_t epd_bw_update(epd_bw_t* epd)
 {
-    init_sequence(epd);
+    esp_err_t ret = init_sequence(epd);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Display reagiert nicht, Update abgebrochen");
+        return ret;
+    }
 
     // RAM beschreiben (BW-Daten)
     send_command(epd, 0x24);
@@ -331,6 +347,8 @@ void epd_bw_update(epd_bw_t* epd)
     {
         ESP_LOGI(TAG, "Vollständiges Update abgeschlossen");
     }
+
+    return ESP_OK;
 }
 
 void epd_bw_update_window(epd_bw_t* epd, uint16_t x, uint16_t y, uint16_t w, uint16_t h)

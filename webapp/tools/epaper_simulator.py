@@ -5,7 +5,7 @@ Pixelgenaue Simulation des 2.9" E-Paper Displays (296x128, 4-Color)
 
 Steuerung:
   Fenster: Pfeiltasten Links/Rechts = Screen wechseln, ESC = Beenden
-  Terminal: Befehle eingeben (z.B. 'soil 80', 'temp 25', 'help' fuer alle)
+  Terminal: Befehle eingeben (z.B. 'soil 80', 'temp 25', 'help' für alle)
 """
 
 import math
@@ -141,7 +141,7 @@ DISPLAY_HEIGHT = 128
 FONT_W = 5
 FONT_H = 7
 CHAR_SPACING = 1
-SCALE = 4  # Pixel-Skalierung für Pygame-Fenster
+SCALE = 4  # Pixel-Skalierung für das Simulator-Fenster
 
 
 class DisplayHAL:
@@ -295,10 +295,39 @@ def _draw_text_right(hal, right_x, y, text, scale, color):
     hal.draw_text(x, y, text, scale, color)
 
 
+# Zeitzone wie in der Firmware (config.h): MEZ plus Sommerzeit nach EU-Regel
+TIMEZONE_OFFSET_S = 3600
+
+
+def _is_eu_dst(unix_time):
+    """EU-Sommerzeit: letzter Sonntag im März 01:00 UTC bis letzter Sonntag im Oktober 01:00 UTC."""
+    t = datetime.fromtimestamp(unix_time, tz=timezone.utc)
+    if t.month < 3 or t.month > 10:
+        return False
+    if 3 < t.month < 10:
+        return True
+    # März und Oktober haben 31 Tage; weekday(): Montag = 0, Sonntag = 6
+    last_sunday = 31 - (datetime(t.year, t.month, 31).weekday() + 1) % 7
+    if t.month == 3:
+        return t.day > last_sunday or (t.day == last_sunday and t.hour >= 1)
+    return t.day < last_sunday or (t.day == last_sunday and t.hour < 1)
+
+
+def _local_offset(unix_time):
+    return TIMEZONE_OFFSET_S + (3600 if _is_eu_dst(unix_time) else 0)
+
+
+def _parse_local(text):
+    """'HH:MM DD.MM.YYYY' in deutscher Zeit in Unix-Zeit umrechnen."""
+    local = int(datetime.strptime(text, "%H:%M %d.%m.%Y").replace(tzinfo=timezone.utc).timestamp())
+    return local - _local_offset(local - TIMEZONE_OFFSET_S)
+
+
 def _format_datetime(unix_time):
     if unix_time == 0:
         return "--:-- --.--.----"
-    dt = datetime.fromtimestamp(unix_time, tz=timezone.utc)
+    # Lokalzeit wie auf dem echten Display
+    dt = datetime.fromtimestamp(unix_time + _local_offset(unix_time), tz=timezone.utc)
     return dt.strftime("%H:%M %d.%m.%Y")
 
 
@@ -490,6 +519,7 @@ SCREEN_CALIB_SUCCESS = 4
 SCREEN_CALIB_TIMEOUT = 5
 SCREEN_FACTORY_RESET_CONFIRM = 6
 SCREEN_FACTORY_RESET_DONE = 7
+SCREEN_CALIB_FAILED = 8
 
 SCREEN_NAMES = {
     SCREEN_NORMAL: "Normal",
@@ -498,11 +528,12 @@ SCREEN_NAMES = {
     SCREEN_CALIB_STEP2: "Kalibrierung 2/2",
     SCREEN_CALIB_SUCCESS: "Kalibrierung OK",
     SCREEN_CALIB_TIMEOUT: "Kalibrierung Timeout",
-    SCREEN_FACTORY_RESET_CONFIRM: "Werksreset Bestaetigung",
+    SCREEN_FACTORY_RESET_CONFIRM: "Werksreset Bestätigung",
     SCREEN_FACTORY_RESET_DONE: "Werksreset Fertig",
+    SCREEN_CALIB_FAILED: "Kalibrierung ungültig",
 }
 
-NUM_SCREENS = 8
+NUM_SCREENS = 9
 
 
 def show_setup_screen(hal):
@@ -684,6 +715,44 @@ def show_calibration_timeout(hal):
     hal.draw_text(margin, y, "Alte Werte behalten", 1, COLOR_BLACK)
 
 
+def show_calibration_failed(hal, raw_dry=800, raw_wet=2600):
+    width = hal.width()
+    margin = 6
+    y = 6
+
+    hal.clear(COLOR_WHITE)
+
+    title = "KALIBRIERUNG"
+    title_w = _text_width(title, 2)
+    hal.draw_text((width - title_w) // 2, y, title, 2, COLOR_BLACK)
+    y += FONT_H * 2 + 4
+
+    hal.draw_hline(margin, y, width - 2 * margin, COLOR_BLACK)
+    y += 3
+
+    failed = "UNGUELTIG"
+    failed_w = _text_width(failed, 2)
+    hal.draw_text((width - failed_w) // 2, y, failed, 2, COLOR_RED)
+    y += FONT_H * 2 + 6
+
+    hal.draw_text(margin, y, f"Trocken: {raw_dry}  Nass: {raw_wet}", 1, COLOR_BLACK)
+    y += FONT_H + 4
+
+    hal.draw_text(margin, y, "Trocken muss deutlich ueber Nass liegen.", 1, COLOR_BLACK)
+    y += FONT_H + 2
+
+    hal.draw_text(margin, y, "Alte Werte behalten.", 1, COLOR_BLACK)
+    y += FONT_H + 6
+
+    hal.draw_hline(margin, y, width - 2 * margin, COLOR_BLACK)
+    y += 3
+
+    hal.draw_text(margin, y, "Boot-Taste", 2, COLOR_BLACK)
+    y += FONT_H * 2 + 2
+
+    hal.draw_text(margin, y, "druecken zum Starten", 2, COLOR_BLACK)
+
+
 def show_factory_reset_confirm(hal):
     width = hal.width()
     margin = 6
@@ -702,7 +771,7 @@ def show_factory_reset_confirm(hal):
     hal.draw_text(margin, y, "Reset ausloesen?", 1, COLOR_RED)
     y += FONT_H + 4
 
-    hal.draw_text(margin, y, "3x Reset-Taste gedrueckt.", 1, COLOR_BLACK)
+    hal.draw_text(margin, y, "5x Reset-Taste gedrueckt.", 1, COLOR_BLACK)
     y += FONT_H + 2
 
     hal.draw_text(margin, y, "Alle Einstellungen und", 1, COLOR_BLACK)
@@ -768,6 +837,9 @@ def render_screen(hal, screen_id, data):
         show_factory_reset_confirm(hal)
     elif screen_id == SCREEN_FACTORY_RESET_DONE:
         show_factory_reset_done(hal)
+    elif screen_id == SCREEN_CALIB_FAILED:
+        # Vertauschte Schritte: Trockenwert unter dem Nasswert
+        show_calibration_failed(hal, data.calib_raw_wet, data.calib_raw_dry)
 
 
 # ============================================================================
@@ -783,7 +855,7 @@ Fenster:
   ESC                        Beenden
 
 Terminal-Befehle (Eingabe + Enter):
-  screen <0-7>               Screen wechseln
+  screen <0-8>               Screen wechseln
   temp <wert>                Temperatur in °C          (z.B. temp 22.5)
   rh <wert>                  Luftfeuchtigkeit in %     (z.B. rh 55)
   soil <wert>                Bodenfeuchte in %         (z.B. soil 62)
@@ -797,8 +869,8 @@ Terminal-Befehle (Eingabe + Enter):
   time <on|off>              Zeitsync an/aus           (z.B. time off)
   sleep <sekunden>           Schlafdauer               (z.B. sleep 3600)
   last <HH:MM DD.MM.YYYY>   Letzte Messung             (z.B. last 14:30 01.04.2026)
-  next <HH:MM DD.MM.YYYY>   Naechste Messung           (z.B. next 15:30 01.04.2026)
-  irrigation <ms>            Letzte Bewaesserung in ms (z.B. irrigation 2500)
+  next <HH:MM DD.MM.YYYY>   Nächste Messung            (z.B. next 15:30 01.04.2026)
+  irrigation <ms>            Letzte Bewässerung in ms  (z.B. irrigation 2500)
   id <wert>                  Messungs-ID               (z.B. id 42)
   wakeups <wert>             Gesamte Wakeups           (z.B. wakeups 150)
   awake <wert>               Avg. Awake in Sekunden    (z.B. awake 4.2)
@@ -903,21 +975,17 @@ def parse_command(line, data, state):
             print(f"  Schlafdauer: {data.sleep_duration_s}s")
             return True
         elif cmd == "last":
-            dt = datetime.strptime(arg, "%H:%M %d.%m.%Y")
-            dt = dt.replace(tzinfo=timezone.utc)
-            data.last_measurement_unix = int(dt.timestamp())
+            data.last_measurement_unix = _parse_local(arg)
             print(f"  Letzte Messung: {_format_datetime(data.last_measurement_unix)}")
             return True
         elif cmd == "next":
-            dt = datetime.strptime(arg, "%H:%M %d.%m.%Y")
-            dt = dt.replace(tzinfo=timezone.utc)
-            data.next_measurement_unix = int(dt.timestamp())
+            data.next_measurement_unix = _parse_local(arg)
             data.sleep_duration_s = max(0, data.next_measurement_unix - int(time_mod.time()))
-            print(f"  Naechste Messung: {_format_datetime(data.next_measurement_unix)}")
+            print(f"  Nächste Messung: {_format_datetime(data.next_measurement_unix)}")
             return True
         elif cmd == "irrigation":
             data.last_irrigation_ms = max(0, int(arg))
-            print(f"  Bewaesserung: {data.last_irrigation_ms}ms")
+            print(f"  Bewässerung: {data.last_irrigation_ms}ms")
             return True
         elif cmd == "id":
             data.measurement_id = int(arg)
@@ -953,9 +1021,9 @@ def parse_command(line, data, state):
             print_values(data, state["screen"])
             return True
         else:
-            print(f"  Unbekannter Befehl: {cmd} (Tippe 'help' fuer Hilfe)")
+            print(f"  Unbekannter Befehl: {cmd} (Tippe 'help' für Hilfe)")
     except (ValueError, IndexError):
-        print(f"  Fehler: Ungueltiger Wert fuer '{cmd}'")
+        print(f"  Fehler: Ungültiger Wert für '{cmd}'")
     return False
 
 
@@ -1153,7 +1221,7 @@ def start_embedded(parent):
 
     top.bind("<Key>", on_key)
 
-    log_output("E-Paper Simulator gestartet. 'help' fuer Hilfe.")
+    log_output("E-Paper Simulator gestartet. 'help' für Hilfe.")
     redraw()
 
 

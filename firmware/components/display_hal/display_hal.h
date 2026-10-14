@@ -68,7 +68,8 @@ void display_hal_draw_hline(int x, int y, int w, display_color_t color);
 // Zeichnet eine vertikale Linie
 void display_hal_draw_vline(int x, int y, int h, display_color_t color);
 
-// Überträgt den Framebuffer zum Display (Full Refresh)
+// Überträgt den Framebuffer zum Display (Full Refresh).
+// Reagiert das Display nicht, wird es bis zum nächsten Init deaktiviert.
 void display_hal_update(void);
 
 // Partielles Update eines Bereichs (nur BW, bei 4-Color Fallback auf Full)
@@ -83,7 +84,7 @@ int display_hal_width(void);
 // Gibt die aktuelle Display-Höhe zurück (abhängig von Rotation)
 int display_hal_height(void);
 
-// Gibt true zurück wenn 4-Farben Display aktiv ist
+// Gibt true zurück, wenn das Display Farben darstellen kann (BWR oder 4-Farben)
 bool display_hal_supports_color(void);
 
 #endif // DISPLAY_HAL_H

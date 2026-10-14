@@ -1,6 +1,6 @@
 /**
  * @file lm393.c
- * @brief Treiber für LM393 Bodenfeuchtesensor (kapazitiv)
+ * @brief Treiber für LM393 Bodenfeuchtesensor (resistiv)
  */
 
 #include "lm393.h"

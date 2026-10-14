@@ -10,19 +10,32 @@ from typing import Callable, Awaitable
 from bleak import BleakScanner, BleakClient, BleakError
 
 from src.utils.constants import (
-    UUID_SVC_CUSTOM, UUID_CHR_MEAS, UUID_CHR_TIME,
+    UUID_SVC_CUSTOM, UUID_CHR_MEAS, UUID_CHR_MEAS_IND, UUID_CHR_TIME,
     UUID_CHR_SLEEP, UUID_CHR_TARGET, UUID_CHR_OFFLINE_SLEEP,
     UUID_CHR_IRRIGATION, UUID_CHR_IRR_DELTA,
     DEVICE_NAME, load_plant_presets,
 )
 from src.ble.parser import MeasurementParser
 from src.core.weather import get_weather_for_device
-from src.core.brain import COOLDOWN_SECONDS, MIN_SLEEP_S
+from src.core.brain import MIN_SLEEP_S
 
 logger = logging.getLogger("BleWorker")
 
-# Maximale Wartezeit auf Messungen (Sekunden)
+# Maximale Wartezeit auf die erste Messung nach dem Verbinden (Sekunden)
 RECEIVE_TIMEOUT_S = 20
+# Bei einem frisch registrierten Gerät: Ein schon eingerichteter Knoten sendet seine
+# erste Messung direkt nach dem Verbinden, einer in der Ersteinrichtung gar keine
+SETUP_PROBE_S = 3
+# Maximale Pause zwischen zwei Messungen, solange der Knoten seinen Puffer nachsendet
+RECEIVE_IDLE_TIMEOUT_S = 5
+# Obergrenze für die gesamte Empfangsphase. Aktuelle Firmware löscht eine gepufferte
+# Messung erst, wenn der Host den Empfang bestätigt hat (Indication). Was bis hierhin
+# nicht ankommt, sendet sie beim nächsten Kontakt.
+RECEIVE_MAX_S = 180
+# Nach der aktuellen Messung wartet die Firmware höchstens 10 s auf die Befehle
+# (BLE_COMMAND_TIMEOUT_MS). Das Wetter wird deshalb schon beim Verbinden abgerufen,
+# und das Brain wartet danach höchstens so lange darauf (Sekunden).
+WEATHER_WAIT_S = 3
 
 
 class BleWorker:
@@ -35,11 +48,17 @@ class BleWorker:
 
     async def run(self):
         await self.broadcast("log", {"message": "BLE Scanner gestartet..."})
+        error_delay = 2.0
+        last_error = None
         while self.running:
             try:
                 scan_results = await BleakScanner.discover(
                     timeout=4.0, return_adv=True
                 )
+                if last_error is not None:
+                    await self.broadcast("log", {"message": "BLE Scanner läuft wieder"})
+                    last_error = None
+                    error_delay = 2.0
 
                 for device, adv_data in scan_results.values():
                     name = device.name or adv_data.local_name or "Unbekannt"
@@ -64,9 +83,14 @@ class BleWorker:
                             await self.connect_and_sync(device)
 
             except Exception as e:
-                logger.error(f"Scanner Fehler: {e}")
-                await self.broadcast("log", {"message": f"Scanner Fehler: {e}"})
-                await asyncio.sleep(2.0)
+                # Ohne Bluetooth scheitert jeder Scan: nur neue Fehler melden
+                # und die Abstände bis 60 s verlängern, statt alle 3 s zu loggen
+                if str(e) != last_error:
+                    last_error = str(e)
+                    logger.error(f"Scanner Fehler: {e}")
+                    await self.broadcast("log", {"message": f"Scanner Fehler: {e}"})
+                await asyncio.sleep(error_delay)
+                error_delay = min(error_delay * 2, 60.0)
 
             await asyncio.sleep(1.0)
 
@@ -97,51 +121,40 @@ class BleWorker:
                 await self.broadcast("device_connected", {"mac": mac})
                 self.data_manager.update_last_seen(mac)
 
-                # First-Setup-Sonderpfad: ESP ist in STATE_FIRST_SETUP und sendet
-                # noch keine Messung. Phase 1 würde 20 s in den Timeout laufen.
-                # Direkt Phase 3 senden, die Messung kommt nach dem kurzen Deep
-                # Sleep im nächsten Connect-Zyklus.
+                # Frisch registriertes Gerät: Ein Knoten in der Ersteinrichtung sendet
+                # keine Messung, sondern wartet nur auf die Konfiguration. Deshalb hier
+                # nicht 20 s auf die erste Messung warten. War der Knoten aber schon
+                # eingerichtet (neuer Host, Gerät gelöscht und neu hinzugefügt), schickt
+                # er sofort seinen Puffer und die aktuelle Messung. Die werden ganz
+                # normal gespeichert und ausgewertet, sonst gingen sie verloren.
                 device = self.data_manager.get_device(mac)
                 first_setup = device.get("first_setup", {}) if device else {}
                 is_first_setup = not first_setup.get("completed", True)
 
-                if is_first_setup:
+                # Wetter parallel zum Empfang abrufen (siehe WEATHER_WAIT_S)
+                weather_task = self._start_weather_fetch(device)
+
+                # ── Phase 1: Empfang ─────────────────────────────────────
+                # Notifications sofort starten (kein Delay!). Die Firmware liest
+                # Befehle erst, wenn sie aktiv sind, auch in der Ersteinrichtung.
+                buffered, online_measurement = await self._receive_measurements(
+                    client, mac,
+                    first_timeout_s=SETUP_PROBE_S if is_first_setup else RECEIVE_TIMEOUT_S,
+                )
+                if is_first_setup and not buffered and not online_measurement:
                     await self.broadcast("log", {
-                        "message": "First-Setup erkannt: Phase 1 übersprungen, sende Konfiguration direkt"
+                        "message": "Knoten in der Ersteinrichtung, sende Konfiguration"
                     })
-                    await self._send_all_commands(client, mac, decision=None)
-                else:
-                    # ── Phase 1: Empfang ─────────────────────────────────────
-                    # Notifications sofort starten (kein Delay!)
-                    buffered, online_measurement = await self._receive_measurements(
-                        client, mac
-                    )
 
-                    # Timestamps rekonstruieren (offline-Messungen rückrechnen)
-                    self.data_manager.reconstruct_timestamps(buffered, online_measurement)
+                # ── Phase 2: Verarbeitung ────────────────────────────────
+                decision = await self._process_measurements(
+                    mac, buffered, online_measurement, weather_task
+                )
 
-                    # Historie VOR dem Schreiben der gepufferten Messungen holen,
-                    # damit history[-1] immer der letzte abgeschlossene Zyklus ist
-                    history = self.data_manager.get_history(mac, limit=10)
-
-                    # Gepufferte Messungen in CSV schreiben (jetzt mit korrekten Timestamps)
-                    for m in buffered:
-                        self.data_manager.append_measurement(mac, m)
-
-                    # ── Phase 2: Verarbeitung ────────────────────────────────
-                    decision = None
-                    if online_measurement:
-                        decision = await self._process_smart_logic(
-                            mac, online_measurement, history
-                        )
-                        # Online-Messung erst nach Brain-Entscheidung in CSV
-                        # schreiben, damit brain_sleep_s etc. enthalten sind
-                        self.data_manager.append_measurement(mac, online_measurement)
-
-                    # ── Phase 3: Senden ──────────────────────────────────────
-                    await self._send_all_commands(
-                        client, mac, decision
-                    )
+                # ── Phase 3: Senden ──────────────────────────────────────
+                await self._send_all_commands(
+                    client, mac, decision
+                )
 
         except BleakError as e:
             logger.error(f"Bleak Fehler bei {mac}: {e}")
@@ -157,12 +170,13 @@ class BleWorker:
     # Phase 1: Empfang - Alle Messungen empfangen
     # =====================================================================
 
-    async def _receive_measurements(self, client, mac):
+    async def _receive_measurements(self, client, mac, first_timeout_s=RECEIVE_TIMEOUT_S):
         """
         Empfängt alle Messungen von der Firmware.
 
         Gepufferte Messungen (online=0) werden gesammelt (nicht sofort geschrieben),
         damit Timestamps nachträglich rekonstruiert werden können.
+        first_timeout_s: so lange wird auf die erste Messung gewartet.
         Gibt (buffered_list, online_measurement) zurück.
         """
         await self.broadcast("log", {"message": "Starte Notifications..."})
@@ -176,12 +190,22 @@ class BleWorker:
             if parsed:
                 queue.put_nowait(parsed)
 
-        await client.start_notify(UUID_CHR_MEAS, notification_handler)
+        # Neuere Firmware sendet die Messungen auch als Indication: Jede Messung wird
+        # bestätigt, erst dann löscht der Knoten sie aus seinem Puffer
+        if client.services.get_characteristic(UUID_CHR_MEAS_IND):
+            await client.start_notify(UUID_CHR_MEAS_IND, notification_handler)
+        else:
+            await client.start_notify(UUID_CHR_MEAS, notification_handler)
         await self.broadcast("log", {"message": "Notifications aktiv, empfange Daten..."})
 
-        # Auf Messungen warten bis online=1 kommt oder Timeout
-        deadline = asyncio.get_event_loop().time() + RECEIVE_TIMEOUT_S
-        while asyncio.get_event_loop().time() < deadline:
+        # Auf Messungen warten bis online=1 kommt oder Timeout. Solange noch
+        # gepufferte Messungen eintreffen, wird weiter gewartet: Ein fester
+        # Timeout würde bei großem Puffer die letzten Messungen verlieren, weil
+        # die Firmware sie nach dem Senden bereits gelöscht hat.
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        deadline = start + first_timeout_s
+        while loop.time() < deadline:
             if not client.is_connected:
                 break
 
@@ -189,6 +213,7 @@ class BleWorker:
                 parsed = await asyncio.wait_for(
                     queue.get(), timeout=1.0
                 )
+                deadline = min(loop.time() + RECEIVE_IDLE_TIMEOUT_S, start + RECEIVE_MAX_S)
 
                 # Gepufferte Messungen sammeln (CSV-Schreiben nach Rekonstruktion)
                 if not parsed["online"]:
@@ -215,7 +240,7 @@ class BleWorker:
             except asyncio.TimeoutError:
                 continue
 
-        if not online_measurement:
+        if not online_measurement and (buffered_measurements or first_timeout_s >= RECEIVE_TIMEOUT_S):
             await self.broadcast("log", {
                 "message": "Keine aktuelle Messung empfangen (nur gepufferte oder Timeout)"
             })
@@ -223,10 +248,37 @@ class BleWorker:
         return buffered_measurements, online_measurement
 
     # =====================================================================
-    # Phase 2: Verarbeitung - Smart-Logic
+    # Phase 2: Verarbeitung - Speichern und Smart-Logic
     # =====================================================================
 
-    async def _process_smart_logic(self, mac, parsed, history):
+    async def _process_measurements(self, mac, buffered, online, weather_task=None):
+        """
+        Speichert die empfangenen Messungen und berechnet für die aktuelle
+        Messung die Brain-Entscheidung. Gibt die BrainDecision zurück
+        (None, wenn keine aktuelle Messung ankam).
+        """
+        # Timestamps rekonstruieren (offline-Messungen rückrechnen)
+        self.data_manager.reconstruct_timestamps(buffered, online)
+
+        # Gepufferte Messungen zuerst speichern: Sie sind neuer als alles in der CSV,
+        # und das Brain soll Trend und Trocknungsrate auch aus ihnen berechnen
+        # (z. B. aus der Kontrollmessung direkt nach einer Bewässerung)
+        for m in buffered:
+            self.data_manager.append_measurement(mac, m)
+
+        await self._update_pump_state(mac, buffered + ([online] if online else []))
+
+        if not online:
+            return None
+
+        history = self.data_manager.get_history(mac, limit=10)
+        decision = await self._process_smart_logic(mac, online, history, weather_task)
+        # Online-Messung erst nach Brain-Entscheidung in CSV
+        # schreiben, damit brain_sleep_s etc. enthalten sind
+        self.data_manager.append_measurement(mac, online)
+        return decision
+
+    async def _process_smart_logic(self, mac, parsed, history, weather_task=None):
         """
         Berechnet Smart Sleep und Bewässerungsentscheidung.
         Gibt die BrainDecision zurück.
@@ -241,25 +293,22 @@ class BleWorker:
         # Wetter holen (nur Outdoor)
         weather_data = None
         if is_outdoor:
-            weather_data = await get_weather_for_device(dev)
+            weather_data = await self._await_weather(weather_task or self._start_weather_fetch(dev))
             if weather_data:
-                self.data_manager.settings[mac]["last_weather"] = {
+                self.data_manager.update_device(mac, last_weather={
                     **weather_data,
                     "fetched_at": int(time.time()),
-                }
-                self.data_manager.save_settings()
+                })
                 await self.broadcast("log", {
                     "message": f"Wetter: {weather_data.get('temperature')}°C, "
                                f"Regen 1h: {weather_data.get('precipitation_next_1h', 0)}mm"
                 })
 
         # Plant-Multiplier aus Preset holen
-        plant_multiplier = self._get_plant_multiplier(
-            dev.get("plant_type", "Standard (Normal)")
-        )
+        plant_multiplier = self._get_plant_multiplier(dev.get("preset_id"))
 
-        # Vorherige Messung für Trend-Erkennung (history wurde VOR dem
-        # Schreiben gepufferter Messungen geholt → [-1] ist letzter Zyklus)
+        # Vorherige Messung für Trend-Erkennung (history enthält auch die gerade
+        # empfangenen gepufferten Messungen → [-1] ist die Messung davor)
         previous_soil = None
         if len(history) >= 1:
             prev = history[-1]
@@ -448,10 +497,47 @@ class BleWorker:
             logger.error(f"Fehler Config Sync: {e}")
             await self.broadcast("log", {"message": f"Fehler Config Sync: {e}"})
 
-    def _get_plant_multiplier(self, plant_type_name):
-        """Holt den numerischen Multiplikator für einen Pflanzentyp."""
+    async def _update_pump_state(self, mac, measurements):
+        """Wertet die Bewässerungen aus: Blieb der Boden trotz Pumpen trocken, meldet
+        die Firmware pump_dry. Der Zustand gilt bis zur nächsten Bewässerung mit Wirkung."""
+        for m in measurements:
+            if not m.get("irrigated"):
+                continue
+            dry = bool(m.get("pump_dry"))
+            if self.data_manager.set_pump_dry(mac, dry) and dry:
+                await self.broadcast("alert", {
+                    "type": "pump_dry",
+                    "mac": mac,
+                    "message": "Pumpe fördert kein Wasser, Tank leer?",
+                })
+
+    @staticmethod
+    def _start_weather_fetch(dev):
+        """Startet den Wetterabruf für ein Outdoor-Gerät als Task (sonst None)."""
+        if not dev or dev.get("type") != "outdoor":
+            return None
+        return asyncio.create_task(get_weather_for_device(dev))
+
+    async def _await_weather(self, task):
+        """Wartet höchstens WEATHER_WAIT_S auf den Wetterabruf. Ein verspäteter Abruf
+        läuft weiter und füllt den Cache für den nächsten Kontakt."""
+        done, _ = await asyncio.wait({task}, timeout=WEATHER_WAIT_S)
+        if task in done:
+            try:
+                return task.result()
+            except Exception as e:
+                # Ohne Wetter weiterentscheiden, statt den ganzen Sync abzubrechen
+                logger.error(f"Wetter-Abruf fehlgeschlagen: {e}")
+                return None
+        await self.broadcast("log", {
+            "message": f"Wetter nach {WEATHER_WAIT_S} s noch nicht geladen, entscheide ohne Wetter"
+        })
+        return None
+
+    def _get_plant_multiplier(self, preset_id):
+        """Holt den Schlaf-Multiplikator des Presets (1,0 ohne passendes Preset)."""
         presets = load_plant_presets()
         for p in presets:
-            if p.get("name") == plant_type_name:
+            if p.get("id") == preset_id:
                 return p.get("sleep_multiplier", 1.0)
         return 1.0

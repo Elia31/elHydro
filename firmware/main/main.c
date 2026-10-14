@@ -132,8 +132,9 @@ typedef struct
 
     // Bewässerung
     bool     irrigated;       // in DIESEM Wake-Zyklus wurde gegossen?
-    uint32_t irrigation_ms;   // gesamte Ventil-Offen-Zeit in diesem Zyklus (ms)
+    uint32_t irrigation_ms;   // gesamte Pumpenlaufzeit in diesem Zyklus (ms)
     bool     should_irrigate; // soll in diesem Zyklus gegossen werden?
+    bool     pump_dry;        // gegossen, aber Boden nicht feuchter geworden (Tank leer?)
 
     // BLE-Status
     bool ble_connected;
@@ -179,6 +180,9 @@ static bool          g_current_meas_valid = false;
 // Power Management Lock
 static esp_pm_lock_handle_t s_pm_lock = NULL;
 
+// Display beim Start erfolgreich initialisiert? (sonst Betrieb ohne Anzeige)
+static bool s_display_ok = false;
+
 // ============================================================================
 // RTC-Daten (überleben Deep Sleep)
 // ============================================================================
@@ -189,6 +193,7 @@ RTC_DATA_ATTR static uint32_t s_rtc_sync_count      = 0;
 RTC_DATA_ATTR static int32_t  s_rtc_last_drift_s    = 0;
 RTC_DATA_ATTR static float    s_rtc_drift_ppm       = 0.0f; // Gemessene Drift-Rate in ppm
 RTC_DATA_ATTR static uint64_t s_rtc_last_sync_rtc_s = 0;    // RTC-Counter bei letztem Sync
+RTC_DATA_ATTR static uint8_t  s_rtc_setup_retry     = 0;    // Schläft nach Setup-Timeout (Setup-Bildschirm steht noch)
 
 // ============================================================================
 // RTC-Zeit Funktionen
@@ -279,6 +284,31 @@ static inline int32_t clamp_0_100(int32_t value)
     if (value > 100)
         return 100;
     return value;
+}
+
+static inline uint32_t clamp_u32(uint32_t value, uint32_t min, uint32_t max)
+{
+    if (value < min)
+        return min;
+    if (value > max)
+        return max;
+    return value;
+}
+
+// Steuerwerte vom Host auf gültige Bereiche begrenzen
+static void validate_control(ble_link_control_t* ctrl)
+{
+    if (ctrl->target_soil_pct > 100)
+        ctrl->target_soil_pct = 100;
+    if (ctrl->irrigation_start_delta > 100)
+        ctrl->irrigation_start_delta = 100;
+    if (ctrl->offline_sleep_s == 0)
+        ctrl->offline_sleep_s = DEFAULT_OFFLINE_SLEEP_S;
+    if (ctrl->sleep_seconds == 0)
+        ctrl->sleep_seconds = DEFAULT_OFFLINE_SLEEP_S;
+
+    ctrl->offline_sleep_s = clamp_u32(ctrl->offline_sleep_s, OFFLINE_SLEEP_MIN_S, OFFLINE_SLEEP_MAX_S);
+    ctrl->sleep_seconds   = clamp_u32(ctrl->sleep_seconds, SLEEP_MIN_S, SLEEP_MAX_S);
 }
 
 static int moisture_pct_from_raw(int raw)
@@ -472,9 +502,18 @@ static void buf_push(const measurement_t* record)
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE_BUF, NVS_READWRITE, &handle) == ESP_OK)
     {
-        nvs_set_blob(handle, key, record, sizeof(*record));
-        nvs_commit(handle);
+        esp_err_t err = nvs_set_blob(handle, key, record, sizeof(*record));
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
         nvs_close(handle);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Buffer: Speichern fehlgeschlagen (%s)", esp_err_to_name(err));
+            return;
+        }
 
         s_buf_head = (s_buf_head + 1) % MAX_BUFFER_ENTRIES;
         if (s_buf_count < MAX_BUFFER_ENTRIES)
@@ -495,8 +534,9 @@ static int buf_flush_and_send(void)
     }
 
     // Ältesten Eintrag berechnen
-    int oldest = (s_buf_head - s_buf_count + MAX_BUFFER_ENTRIES) % MAX_BUFFER_ENTRIES;
-    int sent   = 0;
+    int oldest   = (s_buf_head - s_buf_count + MAX_BUFFER_ENTRIES) % MAX_BUFFER_ENTRIES;
+    int sent     = 0;
+    int consumed = 0; // gesendete + unlesbare Einträge (vom ältesten an gezählt)
 
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE_BUF, NVS_READWRITE, &handle) != ESP_OK)
@@ -515,18 +555,24 @@ static int buf_flush_and_send(void)
 
         if (nvs_get_blob(handle, key, &record, &size) != ESP_OK)
         {
+            // Fehlender/defekter Eintrag: überspringen, aber als verbraucht zählen,
+            // sonst bleibt er als Phantom-Eintrag dauerhaft im Zähler stehen
+            ESP_LOGW(TAG, "Buffer: Eintrag idx=%d nicht lesbar, überspringe", idx);
+            consumed++;
             continue;
         }
 
-        if (ble_link_notify_measurement(&record) == ESP_OK)
+        // Erst löschen, wenn der Host den Empfang bestätigt hat. Unbestätigte Einträge
+        // bleiben im Puffer und werden beim nächsten Kontakt erneut gesendet.
+        if (ble_link_send_measurement(&record) == ESP_OK)
         {
             sent++;
+            consumed++;
             nvs_erase_key(handle, key);
-            vTaskDelay(pdMS_TO_TICKS(50));
         }
         else
         {
-            ESP_LOGW(TAG, "BLE Notify fehlgeschlagen bei idx=%d", idx);
+            ESP_LOGW(TAG, "BLE: Senden fehlgeschlagen bei idx=%d", idx);
             break;
         }
     }
@@ -535,7 +581,7 @@ static int buf_flush_and_send(void)
     nvs_close(handle);
 
     // Zähler aktualisieren
-    s_buf_count = s_buf_count - sent;
+    s_buf_count = s_buf_count - consumed;
     if (s_buf_count < 0)
     {
         s_buf_count = 0;
@@ -577,9 +623,9 @@ static void gpio_power(gpio_num_t pin, bool on)
     gpio_set_level(pin, on ? 1 : 0);
 }
 
-static void valve_set(bool on)
+static void pump_set(bool on)
 {
-    gpio_power(VALVE_GPIO, on ? VALVE_ACTIVE_LEVEL : !VALVE_ACTIVE_LEVEL);
+    gpio_power(PUMP_GPIO, on ? PUMP_ACTIVE_LEVEL : !PUMP_ACTIVE_LEVEL);
 }
 
 // ============================================================================
@@ -636,7 +682,7 @@ static float read_battery_voltage(void)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // Settling-Pause damit S&H-Kondensator und ADC-Referenz vollstaendig stabil sind
+    // Settling-Pause damit S&H-Kondensator und ADC-Referenz vollständig stabil sind
     vTaskDelay(pdMS_TO_TICKS(50));
 
     const int num_samples = 16;
@@ -685,7 +731,7 @@ static void measure_sensors(void)
         esp_pm_lock_acquire(s_pm_lock);
     }
 
-    // ── Phase 1: Temperatur/Luftfeuchte (HTU21D ueber I2C) ─────────────────
+    // ── Phase 1: Temperatur/Luftfeuchte (HTU21D über I2C) ─────────────────
     gpio_power(TEMP_SENSOR_VCC_PIN, true);
     vTaskDelay(pdMS_TO_TICKS(VCC_INIT_TIME));
 
@@ -699,8 +745,8 @@ static void measure_sensors(void)
     }
     gpio_power(TEMP_SENSOR_VCC_PIN, false);
 
-    // ── Phase 2: Batterie (alle anderen Sensoren stromlos fuer minimale ──
-    //            Stoerungen auf der analogen Versorgung)
+    // ── Phase 2: Batterie (alle anderen Sensoren stromlos für minimale ──
+    //            Störungen auf der analogen Versorgung)
     vTaskDelay(pdMS_TO_TICKS(50));
     g_fsm.last_vbat = read_battery_voltage();
 
@@ -759,8 +805,11 @@ static void sys_log_wakeup_reason(void)
 
 static void sys_check_button_wakeup(void)
 {
-    // Deep Sleep Reset nicht zählen
-    if (esp_reset_reason() == ESP_RST_DEEPSLEEP)
+    // Nur echte Resets über die Reset-Taste (EN-Pin) bzw. Power-On zählen.
+    // Deep-Sleep-, Software-, Panic-, Watchdog- und Brownout-Resets würden sonst
+    // z.B. bei schwachem Akku ungewollt Kalibrierung/Werksreset auslösen.
+    esp_reset_reason_t reason = esp_reset_reason();
+    if (reason != ESP_RST_POWERON && reason != ESP_RST_EXT)
     {
         return;
     }
@@ -849,7 +898,7 @@ static void stats_log(void)
     if (g_fsm.irrigated)
     {
         ESP_LOGI(TAG,
-                 "Bewässerung: JA, Ventil insgesamt %u ms offen (Boden=%u%%, Target=%u%%)",
+                 "Bewässerung: JA, Pumpe insgesamt %u ms an (Boden=%u%%, Target=%u%%)",
                  (unsigned) g_fsm.irrigation_ms,
                  (unsigned) g_fsm.last_soil_pct,
                  (unsigned) g_config.target_soil_pct);
@@ -931,7 +980,7 @@ static void cycle_stats_log(uint32_t total_awake_ms)
     ESP_LOGI(TAG,
              "[CYCLE-STATS] wakeup=%lu init=%lu first_setup=%lu measure=%lu "
              "ble=%lu irrigation=%lu calibration=%lu display=%lu shutdown=%lu "
-             "total_awake=%lu valve_open=%lu irrigated=%d",
+             "total_awake=%lu pump_on=%lu irrigated=%d",
              (unsigned long) g_stats.total_wakeups,
              (unsigned long) s_cycle_state_ms[STATE_INIT],
              (unsigned long) s_cycle_state_ms[STATE_FIRST_SETUP],
@@ -1050,12 +1099,13 @@ static void state_init_handler(void)
                                          .spi_hz      = SPI_HZ,
                                          .upside_down = DISPLAY_UPSIDE_DOWN,
                                          .debug       = DISPLAY_DEBUG };
-    if (display_ui_init(&display_cfg) != ESP_OK)
+
+    s_display_ok = (display_ui_init(&display_cfg) == ESP_OK);
+    if (!s_display_ok)
     {
-        ESP_LOGE(TAG, "Display Initialisierung fehlgeschlagen");
+        // Messen und Bewässern funktionieren auch ohne Anzeige weiter
+        ESP_LOGE(TAG, "Display nicht verfügbar, Betrieb ohne Anzeige");
         gpio_power(DISPLAY_VCC_PIN, false);
-        state_enter(STATE_ERROR);
-        return;
     }
 
     // Sensoren initialisieren
@@ -1107,7 +1157,13 @@ static void state_init_handler(void)
     // Erst-Einrichtung oder normaler Betrieb?
     if (!g_state.initial_setup_done)
     {
-        display_ui_show_setup_screen();
+        // Nach einem Setup-Timeout zeigt das E-Paper den Setup-Bildschirm noch an,
+        // ein erneutes Zeichnen würde nur Strom kosten
+        if (!(s_rtc_setup_retry && esp_reset_reason() == ESP_RST_DEEPSLEEP))
+        {
+            display_ui_show_setup_screen();
+        }
+        s_rtc_setup_retry = 0;
         gpio_power(DISPLAY_VCC_PIN, false);
         memset(&g_stats, 0, sizeof(g_stats));
         state_enter(STATE_FIRST_SETUP);
@@ -1130,10 +1186,11 @@ static void state_first_setup_handler(void)
     bool               got_target     = false;
     bool               config_changed = false;
     ble_link_control_t ctrl           = { 0 };
+    uint32_t           start_tick     = xTaskGetTickCount();
 
     for (;;)
     {
-        // ── Phase 1: Auf BLE-Verbindung warten (kein Timeout) ──────────────
+        // ── Phase 1: Auf BLE-Verbindung warten (höchstens SETUP_WAIT_TIMEOUT_MS) ──
         got_time   = false;
         got_sleep  = false;
         got_target = false;
@@ -1141,6 +1198,19 @@ static void state_first_setup_handler(void)
         ESP_LOGI(TAG, "Setup: Warte auf BLE-Verbindung...");
         while (!ble_link_client_ready())
         {
+            if ((xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS > SETUP_WAIT_TIMEOUT_MS)
+            {
+                ESP_LOGW(TAG, "Setup: Kein Host gefunden, neuer Versuch in %d s", SETUP_RETRY_SLEEP_S);
+                // Teilweise empfangene Einstellungen nicht verlieren
+                if (config_changed)
+                {
+                    nvs_save_config();
+                }
+                s_rtc_setup_retry      = 1;
+                g_fsm.sleep_duration_s = SETUP_RETRY_SLEEP_S;
+                state_enter(STATE_SLEEP);
+                return;
+            }
             vTaskDelay(pdMS_TO_TICKS(BLE_POLL_MS));
         }
         g_fsm.ble_connected = true;
@@ -1160,12 +1230,7 @@ static void state_first_setup_handler(void)
             }
 
             // Eingaben validieren
-            if (ctrl.target_soil_pct > 100)
-                ctrl.target_soil_pct = 100;
-            if (ctrl.offline_sleep_s == 0)
-                ctrl.offline_sleep_s = DEFAULT_OFFLINE_SLEEP_S;
-            if (ctrl.sleep_seconds == 0)
-                ctrl.sleep_seconds = DEFAULT_OFFLINE_SLEEP_S;
+            validate_control(&ctrl);
 
             if (ctrl.have_unix_time)
             {
@@ -1193,6 +1258,15 @@ static void state_first_setup_handler(void)
                     ESP_LOGI(TAG, "Setup: Ziel-Bodenfeuchte auf %u%% gesetzt", ctrl.target_soil_pct);
                 }
                 got_target = true;
+            }
+
+            // Delta ist für das Setup nicht Pflicht, wird aber übernommen, damit
+            // auch der erste Offline-Zyklus mit dem eingestellten Wert rechnet
+            if (ctrl.have_irrigation_start_delta && g_config.irrigation_start_delta != ctrl.irrigation_start_delta)
+            {
+                g_config.irrigation_start_delta = ctrl.irrigation_start_delta;
+                config_changed                  = true;
+                ESP_LOGI(TAG, "Setup: Bewässerungs-Delta auf %u%% gesetzt", ctrl.irrigation_start_delta);
             }
         }
 
@@ -1259,6 +1333,7 @@ static void state_measure_handler(void)
 
     g_current_meas.irrigated     = g_fsm.irrigated ? 1 : 0;
     g_current_meas.irrigation_ms = g_fsm.irrigation_ms;
+    g_current_meas.pump_dry      = g_fsm.pump_dry ? 1 : 0;
 
     g_current_meas.battery_voltage        = g_fsm.last_vbat;
     g_current_meas.target_soil_pct        = g_config.target_soil_pct;
@@ -1306,6 +1381,18 @@ static const uint8_t EVAP_TABLE[3][3] = {
     { 2, 5, 8 },
 };
 
+// Verdunstungs-Index aus EVAP_TABLE (0 wenn Temperatur oder Luftfeuchte fehlen)
+static int evap_index(float temp_c, float rh_pct)
+{
+    if (isnan(temp_c) || isnan(rh_pct))
+    {
+        return 0;
+    }
+    int ti = (temp_c < 15.0f) ? 0 : (temp_c < 30.0f) ? 1 : 2;
+    int hi = (rh_pct > 70.0f) ? 0 : (rh_pct >= 40.0f) ? 1 : 2;
+    return EVAP_TABLE[ti][hi];
+}
+
 // Berechnet adaptive Offline-Sleep-Dauer.
 // Simpler Fallback wenn Host nicht erreichbar — bewusst einfacher als
 // die Host-Brain (kein History, kein Wetter, keine Trends).
@@ -1329,13 +1416,8 @@ static uint32_t calc_offline_sleep_s(uint32_t base_s, int soil_pct, int threshol
     }
 
     // Evaporation: linearer Faktor von 1.0 (evap=0) bis 0.5 (evap=8)
-    if (!isnan(temp_c) && !isnan(rh_pct))
-    {
-        int ti   = (temp_c < 15.0f) ? 0 : (temp_c < 30.0f) ? 1 : 2;
-        int hi   = (rh_pct > 70.0f) ? 0 : (rh_pct >= 40.0f) ? 1 : 2;
-        int evap = EVAP_TABLE[ti][hi];
-        sleep_s  = sleep_s * (16 - evap) / 16;
-    }
+    int evap = evap_index(temp_c, rh_pct);
+    sleep_s  = sleep_s * (16 - evap) / 16;
 
     // Minimum: base/4 (skaliert mit User-Konfiguration, kein harter Wert)
     uint32_t min_s = base_s / 4;
@@ -1383,7 +1465,7 @@ static void state_ble_send_receive_handler(void)
         if (g_current_meas_valid)
         {
             g_current_meas.online = 1;
-            if (ble_link_notify_measurement(&g_current_meas) == ESP_OK)
+            if (ble_link_send_measurement(&g_current_meas) == ESP_OK)
             {
                 ESP_LOGI(TAG, "Aktuelle Messung gesendet (ID=%lu)", (unsigned long) g_current_meas.measurement_id);
                 g_current_meas_valid = false;
@@ -1409,14 +1491,7 @@ static void state_ble_send_receive_handler(void)
     if (got_control)
     {
         // Eingaben validieren
-        if (ctrl.target_soil_pct > 100)
-            ctrl.target_soil_pct = 100;
-        if (ctrl.irrigation_start_delta > 100)
-            ctrl.irrigation_start_delta = 100;
-        if (ctrl.offline_sleep_s == 0)
-            ctrl.offline_sleep_s = DEFAULT_OFFLINE_SLEEP_S;
-        if (ctrl.sleep_seconds == 0)
-            ctrl.sleep_seconds = DEFAULT_OFFLINE_SLEEP_S;
+        validate_control(&ctrl);
 
         if (ctrl.have_unix_time)
         {
@@ -1481,7 +1556,12 @@ static void state_ble_send_receive_handler(void)
         return;
     }
 
-    if (!connected || !got_control)
+    // Nach einer Brain-Entscheidung schickt der Host immer eine Schlafzeit. Kam keine
+    // (z.B. weil die Messung nicht ankam und nur Config und Zeit übertragen wurden),
+    // entscheidet der Knoten wie im Offline-Fall selbst.
+    bool host_decided = got_control && ctrl.have_sleep_s;
+
+    if (!host_decided)
     {
         // Schwelle = max(target - delta, target * 20%, 5%)
         // Skaliert mit dem Target, damit z.B. Sukkulenten (Target 25%) ein
@@ -1497,13 +1577,28 @@ static void state_ble_send_receive_handler(void)
             threshold = target_min;
         }
 
+        // Gieß-Schwelle wie im Host-Brain um den Verdunstungs-Index anheben:
+        // irr_threshold = max(target - delta + evap, target_min), höchstens target - Toleranz
+        int irr_threshold =
+            (int) g_config.target_soil_pct - (int) g_config.irrigation_start_delta + evap_index(g_fsm.last_temp, g_fsm.last_rh);
+        if (irr_threshold < target_min)
+        {
+            irr_threshold = target_min;
+        }
+        // Darüber würde der Gießvorgang sofort wieder enden (Toleranz zum Ziel)
+        if (irr_threshold > (int) g_config.target_soil_pct - IRR_TARGET_TOLERANCE_PCT)
+        {
+            irr_threshold = (int) g_config.target_soil_pct - IRR_TARGET_TOLERANCE_PCT;
+        }
+
         g_fsm.sleep_duration_s =
             calc_offline_sleep_s(g_config.offline_sleep_s, g_fsm.last_soil_pct, threshold, g_fsm.last_temp, g_fsm.last_rh);
 
         ESP_LOGW(TAG,
-                 "Offline: Boden=%d%%, Schwelle=%d%%, Target=%d%%, Sleep=%lus",
+                 "Offline: Boden=%d%%, Schwelle=%d%% (Gießen unter %d%%), Target=%d%%, Sleep=%lus",
                  g_fsm.last_soil_pct,
                  threshold,
+                 irr_threshold,
                  g_config.target_soil_pct,
                  (unsigned long) g_fsm.sleep_duration_s);
 
@@ -1515,7 +1610,7 @@ static void state_ble_send_receive_handler(void)
         {
             ESP_LOGW(TAG, "Offline: Frost-Sperre (%.1f°C <= 0°C), keine Bewässerung", g_fsm.last_temp);
         }
-        else if (g_fsm.last_soil_pct >= threshold)
+        else if (g_fsm.last_soil_pct >= irr_threshold)
         {
             ESP_LOGI(TAG, "Offline: Boden feucht genug, kein Gießen");
         }
@@ -1543,13 +1638,17 @@ static void state_irrigation_handler(void)
     if (!g_fsm.should_irrigate || g_fsm.irrigated)
     {
         ESP_LOGW(TAG, "IRR: nichts zu tun (should_irrigate=%d, irrigated=%d)", g_fsm.should_irrigate, g_fsm.irrigated);
-        state_enter(STATE_MEASURE);
+        state_enter(STATE_UPDATE_DISPLAY);
         return;
     }
 
     ESP_LOGI(TAG, "IRR: Starte Bewässerung");
 
-    uint32_t total_ms = 0;
+    uint32_t total_ms   = 0;
+    int      steps      = 0;     // bisherige Gießschritte
+    int      start_soil = -1;    // Bodenfeuchte vor dem ersten Gießschritt
+    bool     rise_seen  = false; // Bodenfeuchte ist durch das Gießen gestiegen
+    bool     pump_dry   = false;
 
     while (total_ms < IRR_MAX_TOTAL_MS)
     {
@@ -1574,6 +1673,15 @@ static void state_irrigation_handler(void)
 
         ESP_LOGI(TAG, "IRR: Boden=%u%%, Target=%u%% (diff=%d)", soil, target, diff);
 
+        if (start_soil < 0)
+        {
+            start_soil = soil;
+        }
+        else if (soil >= start_soil + IRR_DRY_MIN_RISE_PCT)
+        {
+            rise_seen = true;
+        }
+
         // Abbruchbedingung 1: Ziel erreicht oder überschritten
         if (diff <= 0)
         {
@@ -1586,6 +1694,15 @@ static void state_irrigation_handler(void)
         if (diff <= IRR_TARGET_TOLERANCE_PCT)
         {
             ESP_LOGI(TAG, "IRR: Toleranzbereich erreicht (%d%% <= %d%%), stoppe.", diff, IRR_TARGET_TOLERANCE_PCT);
+            break;
+        }
+
+        // Abbruchbedingung 3: Trockenlauf. Die Pumpe lief schon mehrmals, der Boden
+        // wird aber nicht feuchter. Weiterpumpen würde die Pumpe nur beschädigen.
+        if (!rise_seen && steps >= IRR_DRY_CHECK_STEPS)
+        {
+            ESP_LOGW(TAG, "IRR: Nach %d Schritten kein Anstieg (%d%% -> %u%%), Tank leer? Abbruch.", steps, start_soil, soil);
+            pump_dry = true;
             break;
         }
 
@@ -1617,32 +1734,67 @@ static void state_irrigation_handler(void)
         if (step_ms == 0)
             break;
 
-        // 3) Ventil öffnen und nach step_ms wieder schließen (light sleep)
-        valve_set(true);
+        // 3) Pumpe einschalten und nach step_ms wieder ausschalten
+        pump_set(true);
         vTaskDelay(pdMS_TO_TICKS(step_ms));
-        valve_set(false);
+        pump_set(false);
 
         total_ms += step_ms;
+        steps++;
 
-        // 4) Einsickern lassen (light sleep)
+        // 4) Einsickern lassen
         ESP_LOGI(TAG, "Sicker lassen...");
         vTaskDelay(pdMS_TO_TICKS(IRR_SOAK_MS));
     }
 
     g_fsm.irrigated       = (total_ms > 0);
     g_fsm.irrigation_ms   = total_ms;
+    g_fsm.pump_dry        = pump_dry;
     g_fsm.should_irrigate = false; // für diesen Zyklus erledigt
 
     g_stats.total_irrigation_ms += total_ms;
 
-    ESP_LOGI(TAG, "IRR: Fertig. Total Ventilzeit: %u ms", (unsigned) total_ms);
+    ESP_LOGI(TAG, "IRR: Fertig. Pumpenlaufzeit gesamt: %u ms", (unsigned) total_ms);
 
-    state_enter(STATE_MEASURE);
+    // Nur nach echtem Gießen neu messen. Ohne Wirkung (Ziel schon erreicht) direkt
+    // zur Anzeige: Sonst ginge es über MEASURE zurück in den BLE-State, ohne
+    // Advertising wieder in die Offline-Entscheidung und erneut zum Gießen.
+    state_enter(g_fsm.irrigated ? STATE_MEASURE : STATE_UPDATE_DISPLAY);
 }
 
 // ============================================================================
 // FSM: STATE_CALIBRATION
 // ============================================================================
+
+// Wartet auf einen vollständigen Tastendruck (Drücken + Loslassen) der Boot-Taste.
+// Gibt false zurück, wenn vorher das Kalibrierungs-Timeout abläuft.
+static bool calibration_wait_for_button(uint32_t start_tick)
+{
+    // Eine vom vorherigen Schritt noch gedrückte Taste zählt nicht als neuer Druck
+    bool released = gpio_get_level(BTN_GPIO);
+
+    for (;;)
+    {
+        if ((xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS > CALIBRATION_TIMEOUT_MS)
+        {
+            return false;
+        }
+
+        if (gpio_get_level(BTN_GPIO))
+        {
+            released = true;
+        }
+        else if (released)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50)); // Entprellung
+            if (!gpio_get_level(BTN_GPIO))
+            {
+                return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
 
 static void state_calibration_handler(void)
 {
@@ -1657,63 +1809,53 @@ static void state_calibration_handler(void)
     // Schritt 1: Trockener Sensor
     display_ui_show_calibration_step1();
 
-    bool button_pressed = false;
-    while (!button_pressed)
+    if (!calibration_wait_for_button(start_tick))
     {
-        if ((xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS > CALIBRATION_TIMEOUT_MS)
-        {
-            display_ui_show_calibration_timeout();
-            state_enter(STATE_MEASURE);
-            return;
-        }
-
-        if (!gpio_get_level(BTN_GPIO))
-        {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            button_pressed = true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        display_ui_show_calibration_timeout();
+        state_enter(STATE_MEASURE);
+        return;
     }
 
-    g_calib.raw_dry = read_soil_raw();
+    int raw_dry = read_soil_raw();
 
     // Schritt 2: Nasser Sensor
     display_ui_show_calibration_step2();
 
-    button_pressed = false;
-    while (!button_pressed)
+    if (!calibration_wait_for_button(start_tick))
     {
-        if ((xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS > CALIBRATION_TIMEOUT_MS)
-        {
-            display_ui_show_calibration_timeout();
-            state_enter(STATE_MEASURE);
-            return;
-        }
-
-        if (!gpio_get_level(BTN_GPIO))
-        {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            button_pressed = true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        display_ui_show_calibration_timeout();
+        state_enter(STATE_MEASURE);
+        return;
     }
 
-    g_calib.raw_wet = read_soil_raw();
-
-    // Kalibrierung speichern und anzeigen
-    nvs_save_calib();
-    display_ui_show_calibration_success(g_calib.raw_dry, g_calib.raw_wet);
+    int raw_wet = read_soil_raw();
 
     gpio_power(SOIL_VCC_PIN, false);
 
-    // Warten bis Boot-Taste gedrückt wird
-    while (gpio_get_level(BTN_GPIO))
+    // Plausibilitätsprüfung: Trocken muss deutlich über Nass liegen. Sonst wären
+    // z.B. bei vertauschten Schritten alle Messungen 0% und es würde dauerhaft gegossen.
+    if (raw_dry - raw_wet < CALIB_MIN_SPAN_RAW)
     {
-        vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGW(TAG, "Kalibrierung ungültig (dry=%d, wet=%d), alte Werte bleiben", raw_dry, raw_wet);
+        display_ui_show_calibration_failed(raw_dry, raw_wet);
     }
-    vTaskDelay(pdMS_TO_TICKS(50)); // Entprellung
+    else
+    {
+        // Kalibrierung speichern und anzeigen
+        g_calib.raw_dry = (uint16_t) raw_dry;
+        g_calib.raw_wet = (uint16_t) raw_wet;
+        nvs_save_calib();
+        display_ui_show_calibration_success(g_calib.raw_dry, g_calib.raw_wet);
+    }
+
+    // Warten bis Boot-Taste gedrückt wird (spätestens nach dem Timeout weiter)
+    calibration_wait_for_button(xTaskGetTickCount());
 
     gpio_power(DISPLAY_VCC_PIN, false);
+
+    // Reset-Zähler zurücksetzen, damit ein weiterer Reset nicht als Teil der
+    // Werksreset-Sequenz zählt
+    sys_clear_reset_counter();
 
     // Neustart damit STATE_INIT den First-Setup-Check korrekt durchläuft
     esp_restart();
@@ -1762,10 +1904,14 @@ static void state_update_display_handler(void)
                                .ble_success_pct       = ble_success,
                                .last_irrigation_ms    = g_fsm.irrigation_ms };
 
-    gpio_power(DISPLAY_VCC_PIN, true);
-    vTaskDelay(pdMS_TO_TICKS(VCC_INIT_TIME));
-    display_ui_show_normal_screen(&data);
-    gpio_power(DISPLAY_VCC_PIN, false);
+    // Ohne funktionierendes Display gar nicht erst einschalten (spart Strom und Wachzeit)
+    if (s_display_ok)
+    {
+        gpio_power(DISPLAY_VCC_PIN, true);
+        vTaskDelay(pdMS_TO_TICKS(VCC_INIT_TIME));
+        display_ui_show_normal_screen(&data);
+        gpio_power(DISPLAY_VCC_PIN, false);
+    }
 
     state_enter(STATE_SLEEP);
 }
@@ -1836,7 +1982,7 @@ static void state_sleep_handler(void)
     ble_link_stop();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    valve_set(false);
+    pump_set(false);
     gpio_power(TEMP_SENSOR_VCC_PIN, false);
     gpio_power(SOIL_VCC_PIN, false);
     gpio_power(DISPLAY_VCC_PIN, false);
@@ -1863,9 +2009,12 @@ static void state_sleep_handler(void)
 
 static void state_error_handler(void)
 {
-    ESP_LOGE(TAG, "Fehler! Neustart in 5 Sekunden...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    esp_restart();
+    // Kein sofortiger Neustart: Bei einem dauerhaften Fehler (z.B. NVS oder I2C) würde
+    // der Knoten sonst alle paar Sekunden neu starten und den Akku in Tagen leeren.
+    // Stattdessen schlafen und es nach ERROR_RETRY_SLEEP_S erneut versuchen.
+    ESP_LOGE(TAG, "Fehler! Neuer Versuch in %d s", ERROR_RETRY_SLEEP_S);
+    g_fsm.sleep_duration_s = ERROR_RETRY_SLEEP_S;
+    state_enter(STATE_SLEEP);
 }
 
 // ============================================================================

@@ -300,7 +300,13 @@ void display_hal_update(void)
     {
         return;
     }
-    epd_update(&s_display);
+    if (epd_update(&s_display) != ESP_OK)
+    {
+        // Display reagiert nicht: für den Rest des Wachzyklus nicht mehr ansprechen,
+        // sonst läuft jeder weitere Aufruf erneut in die BUSY-Timeouts
+        ESP_LOGE(TAG, "Update fehlgeschlagen, Display deaktiviert");
+        s_initialized = false;
+    }
 }
 
 void display_hal_update_region(int x, int y, int w, int h)
